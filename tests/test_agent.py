@@ -488,6 +488,33 @@ def test_jev_fallback_uses_llm_once_then_keeps_jev_mode(runner, monkeypatch):
     assert runner.state["decision"]["decision_engine"] == "jev"
 
 
+def test_jev_no_progress_guard_schedules_one_llm_fallback(runner, monkeypatch):
+    runner.state.update(
+        decision={**decision("e3"), "operation": "CLICK", "target": "2", "decision_engine": "jev"},
+        decision_mode="jev_fallback",
+        text_model="provider/selected",
+        history=[
+            {"page_changed": False, "kind": "click"},
+            {"page_changed": False, "kind": "click"},
+        ],
+    )
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    assert runner.state["fallback_pending"]["reason"] == "NO_PROGRESS"
+
+    llm_decision = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    llm = Mock(return_value=llm_decision)
+    jev = Mock()
+    monkeypatch.setattr(loop, "choose_llm", llm)
+    monkeypatch.setattr(loop, "choose", jev)
+    runner.command("predict")
+    llm.assert_called_once()
+    jev.assert_not_called()
+    assert runner.state["decision"]["decision_engine"] == "llm_fallback"
+    assert runner.state["decision"]["fallback_from"]["reason"] == "NO_PROGRESS"
+    assert runner.state["fallback_pending"] is None
+
+
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])
 def test_interrupted_dropdown_mutation_cannot_be_retried_as_stale(monkeypatch, response):
     import jev_ultrafast.browser as browser

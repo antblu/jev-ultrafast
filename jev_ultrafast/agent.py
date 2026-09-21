@@ -69,6 +69,7 @@ class Agent:
             record=bool(self.record_dir),
             question_logging=bool(self.question_log),
             blocked_indices=[],
+            fallback_pending=None,
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -157,16 +158,21 @@ class Agent:
                 state["blocked_indices"] = list(dict.fromkeys(supplied))
             self.pending_requests = []
             decision_mode = state.get("decision_mode", "jev")
-            if decision_mode == "llm":
+            fallback_pending = state.get("fallback_pending")
+            state["fallback_pending"] = None
+            if decision_mode == "llm" or fallback_pending:
+                decision_engine = "llm_fallback" if fallback_pending else "llm"
                 state["decision"] = choose_llm(
                     state["page"],
                     state["goal"],
                     state["history"],
                     model=state.get("text_model"),
                     blocked_indices=state["blocked_indices"],
-                    log_request=lambda request: self._log_request(request, "llm"),
+                    log_request=lambda request: self._log_request(request, decision_engine),
                 )
-                state["decision"]["decision_engine"] = "llm"
+                state["decision"]["decision_engine"] = decision_engine
+                if fallback_pending:
+                    state["decision"]["fallback_from"] = fallback_pending
             else:
                 jev_decision = choose(
                     state["page"],
@@ -271,11 +277,21 @@ class Agent:
                     base64.b64decode(state["page"]["screenshot"])
                 )
             repeated = state["history"][-3:]
-            state["status"] = (
-                "blocked"
-                if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
-                else "ready"
+            no_progress = len(repeated) == 3 and all(
+                h["page_changed"] is False and h["kind"] != "wait" for h in repeated
             )
+            if (
+                no_progress
+                and state.get("decision_mode") == "jev_fallback"
+                and decision.get("decision_engine") == "jev"
+            ):
+                state["status"] = "ready"
+                state["fallback_pending"] = {
+                    "reason": "NO_PROGRESS",
+                    "message": "Three Jev actions produced no observed page change",
+                }
+            else:
+                state["status"] = "blocked" if no_progress else "ready"
         else:
             raise ValueError("Unknown command")
         return self.snapshot()

@@ -132,7 +132,9 @@ function render() {
     done: "Model reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
   };
-  $("status").textContent = labels[state.status] || state.status;
+  $("status").textContent = state.fallback_pending
+    ? "Jev made no progress · LLM fallback ready"
+    : labels[state.status] || state.status;
   if (!page) {
     controls();
     return;

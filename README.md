@@ -65,7 +65,7 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 
 The demo has two decision engines. **TypeSafe Jev** is the default and produces operation and target distributions in one request. **Selected LLM** uses the configured OpenAI-compatible model instead: **Choose next** asks it for exactly one offered operation and indexed target, **Execute choice** runs that observed action through the same freshness and safety checks, and **Run automatically** repeats both phases. The LLM never supplies selectors, coordinates, or executable code. Screenshots remain inspector-only; both engines consume the structured page state.
 
-**Jev with LLM fallback** starts every decision with TypeSafe Jev. If and only if Jev chooses `BLOCKED`, the Selected LLM chooses that one decision from the same filtered observed actions; the next decision starts with Jev again.
+**Jev with LLM fallback** starts every decision with TypeSafe Jev. If Jev chooses `BLOCKED`, or if the local no-progress guard detects three Jev actions with no observed page change, the Selected LLM chooses that one decision from the same filtered observed actions; the next decision starts with Jev again. An LLM fallback that also makes no progress stops normally instead of creating a fallback loop.
 
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
