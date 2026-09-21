@@ -172,7 +172,7 @@ function render() {
   }
   $("targets").innerHTML = [...targets.values()].map((a,i) => {
     const index=String(i+1);
-    return `<div class="target ${index === selectedIndex ? 'selected' : ''}" data-action="${index}" style="left:${100*a.rect.x/page.w}%;top:${100*a.rect.y/page.h}%;width:${100*a.rect.w/page.w}%;height:${100*a.rect.h/page.h}%"><span>${index}</span></div>`;
+    return `<div class="target ${index === selectedIndex ? 'selected' : ''} ${blocked.has(index) ? 'blocked' : ''}" data-action="${index}" style="left:${100*a.rect.x/page.w}%;top:${100*a.rect.y/page.h}%;width:${100*a.rect.w/page.w}%;height:${100*a.rect.h/page.h}%"><span>${index}</span></div>`;
   }).join('');
   $("targets").hidden = !$("overlays").checked;
   $("history").innerHTML = state.history.length

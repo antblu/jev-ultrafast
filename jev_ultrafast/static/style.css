@@ -395,6 +395,15 @@ a:focus-visible {
   color: white;
   border-color: var(--orange);
 }
+.target.blocked {
+  border: 2px dashed #b44949;
+  background: rgb(180 73 73 / 0.16);
+}
+.target.blocked span {
+  background: #b44949;
+  color: white;
+  border-color: #8f3434;
+}
 aside {
   border-left: 1px solid var(--line);
   display: flex;
