@@ -75,6 +75,10 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `MODEL_TIMEOUT_SECONDS` defaults to 60 seconds per attempt. Transient connection errors, read timeouts, rate limits, and retryable 5xx responses are retried up to three times with short exponential backoff. Model requests are read-only; browser mutations are still never retried.
 
+Enable **Log indexed pages** before starting a demo to write one JSONL file per run. It records every indexed observation (including page text, raw observed actions, and the derived element table) and every decision request/question, including requests that later fail. Screenshots and credentials are not logged. `QUESTION_LOG_DIR` selects the server-side destination and defaults to `artifacts/questions`.
+
+After attaching to a tab, **Block from model** accepts current-page element numbers and inclusive ranges such as `1-8, 12`. Blocked elements remain visible in the inspector but are omitted from the Jev/LLM state and target questions. Unblocked elements retain their displayed indices. The same expression is reapplied to each newly observed page, so adjust it when the indexed layout changes.
+
 ## Use the library
 
 ```python

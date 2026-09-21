@@ -63,7 +63,7 @@ def validate_choice(answer, ids):
     return answer
 
 
-def action_space(actions):
+def action_space(actions, blocked_indices=()):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
     operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
@@ -94,6 +94,18 @@ def action_space(actions):
             target = f"{index}:{len(element['options']) + 1}"
             element["options"].append({"index": target, "label": action["label"], "value": action["value"]})
         group[target] = action
+    blocked = {str(index) for index in blocked_indices}
+    if blocked:
+        elements = [element for element in elements if element["index"] not in blocked]
+        targets = {
+            operation: {
+                target: action
+                for target, action in candidates.items()
+                if target.split(":", 1)[0] not in blocked
+            }
+            for operation, candidates in targets.items()
+        }
+        targets = {operation: candidates for operation, candidates in targets.items() if candidates}
     return elements, targets, controls
 
 
@@ -129,8 +141,8 @@ def decision_format(model):
     return "tool" if "glm" in lowered or lowered.startswith("zai-org/") else "json"
 
 
-def choose(state, goal, history):
-    elements, targets, controls = action_space(state["actions"])
+def choose(state, goal, history, *, blocked_indices=(), log_request=None):
+    elements, targets, controls = action_space(state["actions"], blocked_indices)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -166,6 +178,8 @@ def choose(state, goal, history):
         },
         "questions": questions,
     }
+    if log_request:
+        log_request(body)
     started = time.perf_counter()
     result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
@@ -199,8 +213,8 @@ def choose(state, goal, history):
     }
 
 
-def choose_llm(state, goal, history, *, model=None):
-    _, targets, controls = action_space(state["actions"])
+def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None):
+    _, targets, controls = action_space(state["actions"], blocked_indices)
     choices = {
         operation: {
             index: {
@@ -277,6 +291,8 @@ def choose_llm(state, goal, history, *, model=None):
         )
     else:
         body["response_format"] = {"type": "json_object"}
+    if log_request:
+        log_request(body)
     started = time.perf_counter()
     result = post_json(base + "/chat/completions", key, body)
     try:

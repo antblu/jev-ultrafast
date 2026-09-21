@@ -250,6 +250,28 @@ a:focus-visible {
 .overlay-control input {
   accent-color: var(--green);
 }
+.index-filter {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px 10px;
+  margin: -5px 18px 12px;
+  font-size: 11px;
+  color: #77776e;
+}
+.index-filter input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 6px 8px;
+  background: #fdfdfb;
+}
+.index-filter span {
+  grid-column: 1 / -1;
+}
+.choice.blocked {
+  opacity: 0.48;
+}
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 330px;

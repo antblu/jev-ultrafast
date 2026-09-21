@@ -40,6 +40,10 @@
             </select>
           </label>
           <label>LLM model <select id="text-model" name="text-model" required></select></label>
+          <label title="Writes page text, indexed elements, and model questions to the server-side log directory">
+            <input name="log-questions" id="log-questions" type="checkbox" />
+            Log indexed pages
+          </label>
           <span id="model-help">LLM used only when Jev chooses TYPE_TEXT</span>
         </div>
         <div class="task-row">
@@ -117,6 +121,11 @@
             Indexed elements
             <span id="ranking-note">Choose next to rank</span>
           </p>
+          <div class="index-filter">
+            <label for="block-range">Block from model</label>
+            <input id="block-range" type="text" inputmode="numeric" placeholder="e.g. 1-8, 12" />
+            <span id="block-hint">Start a task to see the available range</span>
+          </div>
           <div id="choices" class="choices">
             <p class="muted">Available actions will appear here.</p>
           </div>

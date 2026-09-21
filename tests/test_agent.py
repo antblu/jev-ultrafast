@@ -95,6 +95,14 @@ def test_one_index_per_node_with_operation_specific_targets():
     assert "WAIT" in controls
 
 
+def test_blocked_indices_are_omitted_without_renumbering():
+    elements, targets, controls = model.action_space(page()["actions"], {"1"})
+    assert [element["index"] for element in elements] == ["2"]
+    assert set(targets["CLICK"]) == {"2"}
+    assert "TYPE_TEXT" not in targets
+    assert "WAIT" in controls
+
+
 def test_frame_local_node_ids_get_distinct_global_indices():
     actions = [
         {"id": "e1", "kind": "click", "label": "Outer", "role": "button", "node": 1, "frame_id": "f0"},
@@ -125,6 +133,16 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
     assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+
+
+def test_question_logger_receives_request_before_transport(monkeypatch):
+    logged = []
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(side_effect=RuntimeError("offline")))
+    with pytest.raises(RuntimeError, match="offline"):
+        model.choose(page(), "Find a book", [], log_request=logged.append)
+    assert logged[0]["state"]["elements"][0]["label"] == "Search"
+    assert set(logged[0]["questions"]) == {"operation", "click_target", "type_text_target"}
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -287,6 +305,17 @@ def test_demo_accepts_comma_separated_model_choices(monkeypatch):
     assert demo.text_model_options() == ["provider/default", "provider/second", "provider/third"]
 
 
+def test_agent_logs_every_indexed_observation_as_jsonl(tmp_path, monkeypatch):
+    browser = Mock(observe=Mock(return_value=page()))
+    monkeypatch.setattr(loop, "Browser", Mock(return_value=browser))
+    agent = loop.Agent(None, "Find a book", question_log_dir=tmp_path)
+    records = [json.loads(line) for line in agent.question_log.read_text().splitlines()]
+    assert records[0]["type"] == "observation"
+    assert records[0]["reason"] == "initial"
+    assert records[0]["elements"][0]["operations"] == ["TYPE_TEXT", "CLICK"]
+    assert "screenshot" not in records[0]["page"]
+
+
 def test_missing_text_credential_stops_before_guessing(monkeypatch):
     monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
     with pytest.raises(ValueError, match="TEXT_MODEL_API_KEY"):
@@ -396,7 +425,14 @@ def test_agent_predict_dispatches_to_the_selected_llm_mode(runner, monkeypatch):
     monkeypatch.setattr(loop, "choose_llm", llm)
     monkeypatch.setattr(loop, "choose", jev)
     runner.command("predict")
-    llm.assert_called_once_with(page(), "Find a book", [], model="provider/selected")
+    llm.assert_called_once_with(
+        page(),
+        "Find a book",
+        [],
+        model="provider/selected",
+        blocked_indices=[],
+        log_request=runner._log_request,
+    )
     jev.assert_not_called()
 
 

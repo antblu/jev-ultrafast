@@ -12,6 +12,23 @@ const escape = (value) =>
       ],
   );
 const percent = (value) => value == null ? "—" : `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
+function blockedIndices() {
+  const maximum = state?.elements?.length || 0;
+  const blocked = new Set();
+  const value = $("block-range").value.trim();
+  if (!value) return [];
+  for (const part of value.split(",")) {
+    const match = part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!match) throw Error("Use element numbers or ranges such as 1-8, 12");
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (start < 1 || end < start || end > maximum) {
+      throw Error(`Blocked elements must be within the current range 1-${maximum}`);
+    }
+    for (let index = start; index <= end; index += 1) blocked.add(String(index));
+  }
+  return [...blocked].sort((a, b) => Number(a) - Number(b));
+}
 async function call(name, body = {}) {
   const response = await fetch(`/api/${name}`, {
     method: "POST",
@@ -31,6 +48,8 @@ function controls() {
   $("target").disabled = busy;
   $("decision-mode").disabled = busy;
   $("text-model").disabled = busy;
+  $("log-questions").disabled = busy;
+  $("block-range").disabled = busy || !state?.page;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
   $("auto").disabled = busy || !live;
@@ -118,6 +137,9 @@ function render() {
   $("url").textContent = page.url;
   $("page-title").textContent = page.title;
   $("action-count").textContent = `${state.elements.length} elements`;
+  $("block-hint").textContent = state.elements.length
+    ? `Available now: 1-${state.elements.length}. Reapplied to each new page.`
+    : "No indexed elements are available";
   const chosen = page.actions.find((a) => a.id === d?.choice);
   $("choice-title").textContent = d
     ? chosen?.label || d.choice
@@ -136,11 +158,12 @@ function render() {
   const probability = e => d?.target_probabilities[e.index] ??
     Math.max(-1, ...(e.options || []).map(o=>d?.target_probabilities[o.index] ?? -1));
   const selectedIndex = d?.target?.split(':')[0];
+  const blocked = new Set(state.blocked_indices || []);
   const elements = [...state.elements];
   if (d) elements.sort((a,b)=>probability(b)-probability(a));
   $("choices").innerHTML = elements.map(e => {
     const p = probability(e);
-    return `<div class="choice ${selectedIndex === e.index ? 'best' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${p >= 0 ? percent(p) : '—'}</span></div>`;
+    return `<div class="choice ${selectedIndex === e.index ? 'best' : ''} ${blocked.has(e.index) ? 'blocked' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${blocked.has(e.index) ? 'blocked' : p >= 0 ? percent(p) : '—'}</span></div>`;
   }).join('');
   const targets = new Map();
   for (const a of page.actions) {
@@ -183,12 +206,13 @@ $("task-form").addEventListener("submit", (event) => {
         target_id: $("target").value,
         text_model: $("text-model").value,
         decision_mode: $("decision-mode").value,
+        log_questions: $("log-questions").checked,
       }),
     "Attaching to the selected tab…",
   );
 });
 $("choose").addEventListener("click", () =>
-  perform(() => call("predict"), "Jev is comparing the actions…"),
+  perform(() => call("predict", {blocked_indices: blockedIndices()}), "Jev is comparing the actions…"),
 );
 $("execute").addEventListener("click", () =>
   perform(
@@ -203,12 +227,12 @@ $("auto").addEventListener("click", () =>
     while (automatic && !["done", "blocked"].includes(state.status)) {
       $("status").textContent = "Running…";
       if ($("pace").checked) {
-        await call("predict");
+        await call("predict", {blocked_indices: blockedIndices()});
         await new Promise(resolve => setTimeout(resolve, 450));
         if (!automatic) break;
         await call("act", {fingerprint: state.page.fingerprint});
       } else {
-        await call("tick");
+        await call("tick", {blocked_indices: blockedIndices()});
       }
     }
     automatic = false;

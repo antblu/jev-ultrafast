@@ -1,8 +1,11 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import json
 import os
+import secrets
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .browser import Browser, StalePage
@@ -21,6 +24,7 @@ class Agent:
         target_id=None,
         text_model=None,
         decision_mode="jev",
+        question_log_dir=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -34,6 +38,12 @@ class Agent:
             target_id=target_id,
         )
         self.record_dir = Path(record_dir) if record_dir else None
+        self.question_log = None
+        if question_log_dir:
+            log_dir = Path(question_log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            self.question_log = log_dir / f"questions-{stamp}-{secrets.token_hex(4)}.jsonl"
         self.screenshots = screenshots or bool(record_dir)
         try:
             page = self.browser.observe(screenshot=self.screenshots)
@@ -56,10 +66,42 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            question_logging=bool(self.question_log),
+            blocked_indices=[],
         )
+        self._log_observation(page, "initial")
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
+
+    def _write_log(self, record):
+        if getattr(self, "question_log", None):
+            with self.question_log.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def _log_observation(self, page, reason):
+        if not getattr(self, "question_log", None):
+            return
+        self._write_log(
+            {
+                "type": "observation",
+                "reason": reason,
+                "logged_at": datetime.now(UTC).isoformat(),
+                "page": {key: page.get(key) for key in ("url", "title", "text", "w", "h", "scroll")},
+                "actions": page["actions"],
+                "elements": action_space(page["actions"])[0],
+            }
+        )
+
+    def _log_request(self, request):
+        self._write_log(
+            {
+                "type": "questions",
+                "logged_at": datetime.now(UTC).isoformat(),
+                "decision_mode": self.state.get("decision_mode", "jev"),
+                "request": request,
+            }
+        )
 
     def snapshot(self):
         return {
@@ -72,30 +114,53 @@ class Agent:
         state = self.state
         if name == "tick":
             try:
-                self.command("predict", {})
+                self.command("predict", body)
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                self._log_observation(state["page"], "stale_retry")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
+            state.setdefault("blocked_indices", [])
             if not state["browser"]:
                 raise ValueError("Start a demo first")
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                self._log_observation(state["page"], "freshness_refresh")
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
+            if "blocked_indices" in body:
+                supplied = body["blocked_indices"]
+                available = {element["index"] for element in action_space(state["page"]["actions"])[0]}
+                if (
+                    not isinstance(supplied, list)
+                    or any(not isinstance(index, str) or index not in available for index in supplied)
+                ):
+                    raise ValueError("Blocked element indices must be available on the current page")
+                state["blocked_indices"] = list(dict.fromkeys(supplied))
             if state.get("decision_mode", "jev") == "llm":
                 state["decision"] = choose_llm(
-                    state["page"], state["goal"], state["history"], model=state.get("text_model")
+                    state["page"],
+                    state["goal"],
+                    state["history"],
+                    model=state.get("text_model"),
+                    blocked_indices=state["blocked_indices"],
+                    log_request=self._log_request,
                 )
             else:
-                state["decision"] = choose(state["page"], state["goal"], state["history"])
+                state["decision"] = choose(
+                    state["page"],
+                    state["goal"],
+                    state["history"],
+                    blocked_indices=state["blocked_indices"],
+                    log_request=self._log_request,
+                )
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -161,6 +226,7 @@ class Agent:
                 }
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            self._log_observation(state["page"], "after_action")
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],

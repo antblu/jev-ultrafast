@@ -104,6 +104,11 @@ def command(name, body):
             target_id=target["id"],
             text_model=text_model,
             decision_mode=decision_mode,
+            question_log_dir=(
+                os.environ.get("QUESTION_LOG_DIR", "artifacts/questions")
+                if body.get("log_questions")
+                else None
+            ),
             record_dir=(
                 Path.cwd() / "artifacts" / "frames"
                 if body.get("record")
