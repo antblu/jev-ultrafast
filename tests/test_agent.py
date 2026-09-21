@@ -103,6 +103,11 @@ def test_blocked_indices_are_omitted_without_renumbering():
     assert "WAIT" in controls
 
 
+def test_blocked_indices_are_removed_from_raw_logged_actions():
+    actions = model.filter_blocked_actions(page()["actions"], {"1"})
+    assert [action["id"] for action in actions] == ["e3", "wait"]
+
+
 def test_frame_local_node_ids_get_distinct_global_indices():
     actions = [
         {"id": "e1", "kind": "click", "label": "Outer", "role": "button", "node": 1, "frame_id": "f0"},
@@ -305,15 +310,42 @@ def test_demo_accepts_comma_separated_model_choices(monkeypatch):
     assert demo.text_model_options() == ["provider/default", "provider/second", "provider/third"]
 
 
-def test_agent_logs_every_indexed_observation_as_jsonl(tmp_path, monkeypatch):
-    browser = Mock(observe=Mock(return_value=page()))
+def test_agent_logs_filtered_elements_and_decision_only_after_execution(tmp_path, monkeypatch):
+    p = page()
+    browser = Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p))
     monkeypatch.setattr(loop, "Browser", Mock(return_value=browser))
     agent = loop.Agent(None, "Find a book", question_log_dir=tmp_path)
+    logged_decision = decision("e3")
+    logged_decision.update(operation="CLICK", target="2", model="jev-test")
+
+    def choose_with_log(*_args, log_request, **_kwargs):
+        log_request({"questions": {"operation": {}}})
+        return logged_decision
+
+    monkeypatch.setattr(loop, "choose", choose_with_log)
+    assert not agent.question_log.exists()
+    agent.command("predict", {"blocked_indices": ["1"]})
+    assert not agent.question_log.exists()
+    agent.command("act", {"fingerprint": p["fingerprint"]})
     records = [json.loads(line) for line in agent.question_log.read_text().splitlines()]
-    assert records[0]["type"] == "observation"
-    assert records[0]["reason"] == "initial"
-    assert records[0]["elements"][0]["operations"] == ["TYPE_TEXT", "CLICK"]
+    assert records[0]["type"] == "execution"
+    assert [element["index"] for element in records[0]["elements"]] == ["2"]
+    assert [action["id"] for action in records[0]["actions"]] == ["e3", "wait"]
+    assert records[0]["decision"]["engine"] == "jev"
+    assert records[0]["decision"]["target"] == "2"
+    assert records[0]["executed_action"]["id"] == "e3"
+    assert records[0]["decision_requests"][0]["decision_engine"] == "jev"
     assert "screenshot" not in records[0]["page"]
+
+
+def test_done_or_blocked_decision_does_not_create_execution_log(tmp_path, monkeypatch):
+    p = page()
+    browser = Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p))
+    monkeypatch.setattr(loop, "Browser", Mock(return_value=browser))
+    agent = loop.Agent(None, "Find a book", question_log_dir=tmp_path)
+    agent.state.update(decision=decision("BLOCKED"), status="predicted", started_at=time.perf_counter())
+    agent.command("act", {"fingerprint": p["fingerprint"]})
+    assert not agent.question_log.exists()
 
 
 def test_missing_text_credential_stops_before_guessing(monkeypatch):
@@ -425,15 +457,35 @@ def test_agent_predict_dispatches_to_the_selected_llm_mode(runner, monkeypatch):
     monkeypatch.setattr(loop, "choose_llm", llm)
     monkeypatch.setattr(loop, "choose", jev)
     runner.command("predict")
-    llm.assert_called_once_with(
-        page(),
-        "Find a book",
-        [],
-        model="provider/selected",
-        blocked_indices=[],
-        log_request=runner._log_request,
-    )
+    llm.assert_called_once()
+    assert llm.call_args.args == (page(), "Find a book", [])
+    assert llm.call_args.kwargs["model"] == "provider/selected"
+    assert llm.call_args.kwargs["blocked_indices"] == []
+    assert callable(llm.call_args.kwargs["log_request"])
     jev.assert_not_called()
+
+
+def test_jev_fallback_uses_llm_once_then_keeps_jev_mode(runner, monkeypatch):
+    runner.state.update(status="ready", decision=None, decision_mode="jev_fallback", text_model="provider/selected")
+    jev_decision = decision("BLOCKED")
+    jev_decision.update(operation="BLOCKED", target=None, model="jev-test")
+    llm_decision = decision("e3")
+    llm_decision.update(operation="CLICK", target="2")
+    next_jev_decision = decision("e3")
+    next_jev_decision.update(operation="CLICK", target="2", model="jev-test")
+    jev = Mock(side_effect=[jev_decision, next_jev_decision])
+    llm = Mock(return_value=llm_decision)
+    monkeypatch.setattr(loop, "choose", jev)
+    monkeypatch.setattr(loop, "choose_llm", llm)
+    runner.command("predict")
+    assert jev.call_count == 1 and llm.call_count == 1
+    assert runner.state["decision"]["choice"] == "e3"
+    assert runner.state["decision"]["decision_engine"] == "llm_fallback"
+    assert runner.state["decision_mode"] == "jev_fallback"
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.command("predict")
+    assert jev.call_count == 2 and llm.call_count == 1
+    assert runner.state["decision"]["decision_engine"] == "jev"
 
 
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])

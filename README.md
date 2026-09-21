@@ -65,6 +65,8 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 
 The demo has two decision engines. **TypeSafe Jev** is the default and produces operation and target distributions in one request. **Selected LLM** uses the configured OpenAI-compatible model instead: **Choose next** asks it for exactly one offered operation and indexed target, **Execute choice** runs that observed action through the same freshness and safety checks, and **Run automatically** repeats both phases. The LLM never supplies selectors, coordinates, or executable code. Screenshots remain inspector-only; both engines consume the structured page state.
 
+**Jev with LLM fallback** starts every decision with TypeSafe Jev. If and only if Jev chooses `BLOCKED`, the Selected LLM chooses that one decision from the same filtered observed actions; the next decision starts with Jev again.
+
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
 `TYPESAFE_MODEL` chooses the default Jev model. `TEXT_MODEL_API_KEY`, `TEXT_MODEL_BASE_URL`, `TEXT_MODEL`, and `TEXT_MODEL_REASONING` configure the OpenAI-compatible LLM. In Jev mode that LLM is called only for `TYPE_TEXT`; in LLM decision mode it also selects actions. The demo lists the default plus comma-separated `TEXT_MODEL_OPTIONS`, so several compatible models can be selected per run without exposing credentials to the browser. The example configuration uses OpenRouter and `inception/mercury-2.5` with reasoning disabled.
@@ -75,7 +77,7 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `MODEL_TIMEOUT_SECONDS` defaults to 60 seconds per attempt. Transient connection errors, read timeouts, rate limits, and retryable 5xx responses are retried up to three times with short exponential backoff. Model requests are read-only; browser mutations are still never retried.
 
-Enable **Log indexed pages** before starting a demo to write one JSONL file per run. It records every indexed observation (including page text, raw observed actions, and the derived element table) and every decision request/question, including requests that later fail. Screenshots and credentials are not logged. `QUESTION_LOG_DIR` selects the server-side destination and defaults to `artifacts/questions`.
+Enable **Log indexed pages** before starting a demo to write one JSONL file per run. A record is appended only after a guarded browser action executes successfully; previewed decisions, failed actions, `DONE`, and `BLOCKED` do not write records. Each execution record contains the page state, unblocked observed actions and element table, the executed element, whether Jev, direct LLM, or LLM fallback chose it, and the decision request(s) that led to it. Blocked element and action records, screenshots, and credentials are not logged. `QUESTION_LOG_DIR` selects the server-side destination and defaults to `artifacts/questions`.
 
 After attaching to a tab, **Block from model** accepts current-page element numbers and inclusive ranges such as `1-8, 12`. Blocked elements remain visible in the inspector and appear as muted red dashed boxes on the webpage preview, but are omitted from the Jev/LLM state and target questions. Unblocked elements retain their displayed indices. The same expression is reapplied to each newly observed page, so adjust it when the indexed layout changes.
 

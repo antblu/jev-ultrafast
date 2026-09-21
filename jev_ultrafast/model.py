@@ -109,6 +109,23 @@ def action_space(actions, blocked_indices=()):
     return elements, targets, controls
 
 
+def filter_blocked_actions(actions, blocked_indices):
+    """Remove indexed actions while preserving unindexed controls and original numbering."""
+    blocked = {str(index) for index in blocked_indices}
+    indices = {}
+    filtered = []
+    for action in actions:
+        if action["kind"] not in {"click", "fill", "select"}:
+            filtered.append(action)
+            continue
+        observed_target = (action.get("frame_id", "f0"), action["node"])
+        if observed_target not in indices:
+            indices[observed_target] = str(len(indices) + 1)
+        if indices[observed_target] not in blocked:
+            filtered.append(action)
+    return filtered
+
+
 def text_model_config(model=None):
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:

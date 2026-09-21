@@ -91,7 +91,7 @@ def command(name, body):
         if text_model not in text_model_options():
             raise ValueError("Select a configured text model")
         decision_mode = body.get("decision_mode", "")
-        if decision_mode not in {"jev", "llm"}:
+        if decision_mode not in {"jev", "jev_fallback", "llm"}:
             raise ValueError("Select a decision engine")
 
         close_browser()

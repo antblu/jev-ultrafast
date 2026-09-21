@@ -96,17 +96,24 @@ function renderSelectors() {
   ).join("");
   $("text-model").value = state?.text_model || $("text-model").options[0]?.value || "";
   $("decision-mode").value = state?.decision_mode || $("decision-mode").value || "jev";
-  const llmDecision = $("decision-mode").value === "llm";
-  $("model-help").textContent = llmDecision
+  const selectedMode = $("decision-mode").value;
+  $("model-help").textContent = selectedMode === "llm"
     ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : "LLM used only when Jev chooses TYPE_TEXT";
+    : selectedMode === "jev_fallback"
+      ? "Jev chooses first; LLM retries one decision when Jev returns BLOCKED"
+      : "LLM used only when Jev chooses TYPE_TEXT";
 }
 function render() {
   if (!state) return;
   renderSelectors();
   const llmMode = state.decision_mode === "llm";
-  $("choice-model").textContent = llmMode ? `LLM · ${state.text_model}` : state.typesafe_model;
-  $("text-model-tag").textContent = llmMode ? "decisions + text" : `${state.text_model} text helper`;
+  const fallbackMode = state.decision_mode === "jev_fallback";
+  $("choice-model").textContent = llmMode
+    ? `LLM · ${state.text_model}`
+    : fallbackMode ? `${state.typesafe_model} → LLM fallback` : state.typesafe_model;
+  $("text-model-tag").textContent = llmMode
+    ? "decisions + text"
+    : fallbackMode ? `${state.text_model} fallback + text` : `${state.text_model} text helper`;
   $("helper").textContent = `Text helper · ${state.text_model}`;
   $("plan").innerHTML = (state.plan || [])
     .map(
@@ -148,7 +155,8 @@ function render() {
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
   $("completion").textContent = d ? d.operation : "—";
   $("ranking-note").textContent = d
-    ? state.decision_mode === "llm" ? "Chosen by LLM" : "Ranked by Jev"
+    ? d.decision_engine === "llm_fallback" ? "Jev blocked · chosen by LLM"
+      : d.decision_engine === "llm" ? "Chosen by LLM" : "Ranked by Jev"
     : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
   $("operation-choices").innerHTML = op.length
@@ -247,9 +255,12 @@ $("overlays").addEventListener("change", () => {
   $("targets").hidden = !$("overlays").checked;
 });
 $("decision-mode").addEventListener("change", () => {
-  $("model-help").textContent = $("decision-mode").value === "llm"
+  const selectedMode = $("decision-mode").value;
+  $("model-help").textContent = selectedMode === "llm"
     ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : "LLM used only when Jev chooses TYPE_TEXT";
+    : selectedMode === "jev_fallback"
+      ? "Jev chooses first; LLM retries one decision when Jev returns BLOCKED"
+      : "LLM used only when Jev chooses TYPE_TEXT";
 });
 $("choices").addEventListener("pointerover", (event) => {
   const id = event.target.closest("[data-action]")?.dataset.action;

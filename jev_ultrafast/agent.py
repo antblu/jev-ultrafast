@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, choose_llm, field_context, field_text
+from .model import action_space, choose, choose_llm, field_context, field_text, filter_blocked_actions
 from .questions import MAX_STEPS
 
 
@@ -29,8 +29,8 @@ class Agent:
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
-        if decision_mode not in {"jev", "llm"}:
-            raise ValueError("Decision mode must be jev or llm")
+        if decision_mode not in {"jev", "jev_fallback", "llm"}:
+            raise ValueError("Decision mode must be jev, jev_fallback, or llm")
         plan = [task]
         self.pending_text = None
         self.browser = Browser(
@@ -39,6 +39,7 @@ class Agent:
         )
         self.record_dir = Path(record_dir) if record_dir else None
         self.question_log = None
+        self.pending_requests = []
         if question_log_dir:
             log_dir = Path(question_log_dir)
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +70,6 @@ class Agent:
             question_logging=bool(self.question_log),
             blocked_indices=[],
         )
-        self._log_observation(page, "initial")
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
@@ -79,29 +79,42 @@ class Agent:
             with self.question_log.open("a", encoding="utf-8") as output:
                 output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    def _log_observation(self, page, reason):
+    def _log_execution(self, page, action, decision, text):
         if not getattr(self, "question_log", None):
             return
+        blocked = self.state.get("blocked_indices", [])
         self._write_log(
             {
-                "type": "observation",
-                "reason": reason,
+                "type": "execution",
                 "logged_at": datetime.now(UTC).isoformat(),
+                "blocked_indices": blocked,
                 "page": {key: page.get(key) for key in ("url", "title", "text", "w", "h", "scroll")},
-                "actions": page["actions"],
-                "elements": action_space(page["actions"])[0],
+                "actions": filter_blocked_actions(page["actions"], blocked),
+                "elements": action_space(page["actions"], blocked)[0],
+                "decision": {
+                    "engine": decision.get("decision_engine"),
+                    "mode": self.state.get("decision_mode", "jev"),
+                    "operation": decision["operation"],
+                    "target": decision["target"],
+                    "choice": decision["choice"],
+                    "label": action["label"],
+                    "model": decision.get("model"),
+                    "fallback_from": decision.get("fallback_from"),
+                },
+                "executed_action": {
+                    "id": action["id"],
+                    "kind": action["kind"],
+                    "label": action["label"],
+                    "text": text,
+                },
+                "decision_requests": self.pending_requests,
             }
         )
+        self.pending_requests = []
 
-    def _log_request(self, request):
-        self._write_log(
-            {
-                "type": "questions",
-                "logged_at": datetime.now(UTC).isoformat(),
-                "decision_mode": self.state.get("decision_mode", "jev"),
-                "request": request,
-            }
-        )
+    def _log_request(self, request, decision_engine):
+        if getattr(self, "question_log", None):
+            self.pending_requests.append({"decision_engine": decision_engine, "request": request})
 
     def snapshot(self):
         return {
@@ -120,7 +133,6 @@ class Agent:
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
-                self._log_observation(state["page"], "stale_retry")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
@@ -131,7 +143,6 @@ class Agent:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
-                self._log_observation(state["page"], "freshness_refresh")
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
@@ -144,23 +155,44 @@ class Agent:
                 ):
                     raise ValueError("Blocked element indices must be available on the current page")
                 state["blocked_indices"] = list(dict.fromkeys(supplied))
-            if state.get("decision_mode", "jev") == "llm":
+            self.pending_requests = []
+            decision_mode = state.get("decision_mode", "jev")
+            if decision_mode == "llm":
                 state["decision"] = choose_llm(
                     state["page"],
                     state["goal"],
                     state["history"],
                     model=state.get("text_model"),
                     blocked_indices=state["blocked_indices"],
-                    log_request=self._log_request,
+                    log_request=lambda request: self._log_request(request, "llm"),
                 )
+                state["decision"]["decision_engine"] = "llm"
             else:
-                state["decision"] = choose(
+                jev_decision = choose(
                     state["page"],
                     state["goal"],
                     state["history"],
                     blocked_indices=state["blocked_indices"],
-                    log_request=self._log_request,
+                    log_request=lambda request: self._log_request(request, "jev"),
                 )
+                if decision_mode == "jev_fallback" and jev_decision["choice"] == "BLOCKED":
+                    state["decision"] = choose_llm(
+                        state["page"],
+                        state["goal"],
+                        state["history"],
+                        model=state.get("text_model"),
+                        blocked_indices=state["blocked_indices"],
+                        log_request=lambda request: self._log_request(request, "llm_fallback"),
+                    )
+                    state["decision"]["decision_engine"] = "llm_fallback"
+                    state["decision"]["fallback_from"] = {
+                        "choice": "BLOCKED",
+                        "model": jev_decision["model"],
+                        "latency_ms": jev_decision["latency_ms"],
+                    }
+                else:
+                    state["decision"] = jev_decision
+                    state["decision"]["decision_engine"] = "jev"
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -177,6 +209,7 @@ class Agent:
             state["decision"] = None
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED"}:
+                self.pending_requests = []
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
@@ -225,8 +258,8 @@ class Agent:
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
+            self._log_execution(page, action, decision, text)
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
-            self._log_observation(state["page"], "after_action")
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
