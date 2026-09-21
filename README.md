@@ -63,9 +63,11 @@ uv run jev
 
 Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. The inspector shows numbered elements, operation probabilities, target probabilities, and executed actions. **Choose next** pauses before execution.
 
-The demo has two decision engines. **TypeSafe Jev** is the default and produces operation and target distributions in one request. **Selected LLM** uses the configured OpenAI-compatible model instead: **Choose next** asks it for exactly one offered operation and indexed target, **Execute choice** runs that observed action through the same freshness and safety checks, and **Run automatically** repeats both phases. The LLM never supplies selectors, coordinates, or executable code. Screenshots remain inspector-only; both engines consume the structured page state.
+The demo has two decision engines. **TypeSafe Jev** is the default and produces operation and target distributions in one request. **Selected LLM** uses the configured OpenAI-compatible model instead: **Choose next** asks it for exactly one offered operation and indexed target, **Execute choice** runs that observed action through the same freshness and safety checks, and **Run automatically** repeats both phases. The LLM never supplies selectors, coordinates, or executable code. Both engines start with structured page state.
 
 **Jev with LLM fallback** starts every decision with TypeSafe Jev. If Jev chooses `BLOCKED`, or if the local no-progress guard detects three Jev actions with no observed page change, the Selected LLM chooses that one decision from the same filtered observed actions; the next decision starts with Jev again. An LLM fallback that also makes no progress stops normally instead of creating a fallback loop.
+
+For Selected LLM decisions, the text-only response also reports `screenshot_required`. It may request the current browser image for diagrams, charts, spatial layouts, or other visual information absent from the indexed state. With **Auto-send requested screenshots** enabled, the demo immediately repeats that decision with the image. With it disabled, the run pauses until **Send screenshot** is clicked. Screenshot requests are read-only, image data is redacted from traces and JSONL logs, and no action executes before the visual response passes the normal observed-target validation.
 
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
@@ -108,7 +110,7 @@ uv run --env-file .env python examples/run.py \
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
-- **No screenshots in the default agent loop.** Jev consumes structured state. The inspector opts into screenshots; the video uses a separate continuous screencast.
+- **No screenshots in the default agent loop.** Jev consumes structured state. The inspector captures screenshots for its preview; a Selected LLM receives one only after it explicitly reports `screenshot_required` and the configured automatic/approval policy permits sending it. The video uses a separate continuous screencast.
 - **One browser call per snapshot.** Read visible controls, their names, values, and text atomically. Keep references to the actual DOM nodes.
 - **Validate the selected target.** Clicks check the document, form values, target, and nearby context. Animation alone does not force another prediction. Resolve current geometry and reject covered controls before input.
 - **Wait for useful state.** After typing into a combobox, wait for visible suggestions, capped at 200 ms. Other interactions get at most two animation frames or 50 ms. These reads happen after execution is logged.

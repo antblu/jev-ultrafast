@@ -211,6 +211,54 @@ def test_llm_mode_chooses_only_an_observed_operation_and_target(monkeypatch):
     assert set(sent["choices"]["CLICK"]) == {"1", "2"}
 
 
+def test_llm_can_request_a_screenshot_without_choosing_an_action(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(
+            return_value={
+                "model": "provider/vision-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"screenshot_required":true,"operation":null,"target":null}'
+                        }
+                    }
+                ],
+            }
+        ),
+    )
+    result = model.choose_llm(page(), "Answer the diagram question", [])
+    assert result["screenshot_required"] is True
+    assert result["choice"] is None
+
+
+def test_llm_receives_approved_screenshot_but_logs_redacted_request(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    logged = []
+    post = Mock(
+        return_value={
+            "model": "provider/vision-model",
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"screenshot_required":false,"operation":"CLICK","target":"2"}'
+                    }
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(
+        page(), "Answer the diagram question", [], screenshot="jpeg-base64", log_request=logged.append
+    )
+    sent_content = post.call_args.args[2]["messages"][1]["content"]
+    assert sent_content[1]["image_url"]["url"] == "data:image/jpeg;base64,jpeg-base64"
+    assert logged[0]["messages"][1]["content"][1]["image_url"]["url"] == "[screenshot omitted]"
+    assert result["request"]["messages"][1]["content"][1]["image_url"]["url"] == "[screenshot omitted]"
+
+
 def test_llm_mode_rejects_an_invented_target(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     monkeypatch.setattr(
@@ -463,6 +511,63 @@ def test_agent_predict_dispatches_to_the_selected_llm_mode(runner, monkeypatch):
     assert llm.call_args.kwargs["blocked_indices"] == []
     assert callable(llm.call_args.kwargs["log_request"])
     jev.assert_not_called()
+
+
+def test_screenshot_request_pauses_for_approval_then_chooses(runner, monkeypatch):
+    runner.state.update(
+        status="ready",
+        decision=None,
+        decision_mode="llm",
+        text_model="provider/vision-model",
+        screenshot_mode="approval",
+        screenshot_pending=None,
+    )
+    runner.state["page"]["screenshot"] = "jpeg-base64"
+    screenshot_request = {
+        **decision(None),
+        "choice": None,
+        "operation": None,
+        "target": None,
+        "screenshot_required": True,
+    }
+    visual_decision = {**decision("e3"), "operation": "CLICK", "target": "2", "screenshot_required": False}
+    llm = Mock(side_effect=[screenshot_request, visual_decision])
+    monkeypatch.setattr(loop, "choose_llm", llm)
+    runner.command("predict")
+    assert runner.state["status"] == "screenshot_pending"
+    assert runner.state["decision"] is None
+    runner.state["browser"].act.assert_not_called()
+    runner.command("approve_screenshot", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert llm.call_args.kwargs["screenshot"] == "jpeg-base64"
+    assert runner.state["status"] == "predicted"
+    assert runner.state["decision"]["choice"] == "e3"
+
+
+def test_automatic_screenshot_mode_requeries_without_executing(runner, monkeypatch):
+    runner.state.update(
+        status="ready",
+        decision=None,
+        decision_mode="llm",
+        text_model="provider/vision-model",
+        screenshot_mode="auto",
+        screenshot_pending=None,
+    )
+    runner.state["page"]["screenshot"] = "jpeg-base64"
+    screenshot_request = {
+        **decision(None),
+        "choice": None,
+        "operation": None,
+        "target": None,
+        "screenshot_required": True,
+    }
+    visual_decision = {**decision("e3"), "operation": "CLICK", "target": "2", "screenshot_required": False}
+    llm = Mock(side_effect=[screenshot_request, visual_decision])
+    monkeypatch.setattr(loop, "choose_llm", llm)
+    runner.command("predict")
+    assert llm.call_count == 2
+    assert llm.call_args.kwargs["screenshot"] == "jpeg-base64"
+    assert runner.state["decision"]["choice"] == "e3"
+    runner.state["browser"].act.assert_not_called()
 
 
 def test_jev_fallback_uses_llm_once_then_keeps_jev_mode(runner, monkeypatch):

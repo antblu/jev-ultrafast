@@ -42,16 +42,20 @@ async function call(name, body = {}) {
   return data;
 }
 function controls() {
-  const live = state?.page && !["done", "blocked"].includes(state.status);
+  const screenshotPending = state?.status === "screenshot_pending";
+  const live = state?.page && !["done", "blocked", "screenshot_pending"].includes(state.status);
   $("start").disabled = busy;
   $("goal").disabled = busy;
   $("target").disabled = busy;
   $("decision-mode").disabled = busy;
   $("text-model").disabled = busy;
   $("log-questions").disabled = busy;
+  $("auto-screenshot").disabled = busy;
   $("block-range").disabled = busy || !state?.page;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
+  $("approve-screenshot").disabled = busy || !screenshotPending;
+  $("approve-screenshot").hidden = !screenshotPending;
   $("auto").disabled = busy || !live;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
@@ -96,6 +100,7 @@ function renderSelectors() {
   ).join("");
   $("text-model").value = state?.text_model || $("text-model").options[0]?.value || "";
   $("decision-mode").value = state?.decision_mode || $("decision-mode").value || "jev";
+  if (state?.screenshot_mode) $("auto-screenshot").checked = state.screenshot_mode === "auto";
   const selectedMode = $("decision-mode").value;
   $("model-help").textContent = selectedMode === "llm"
     ? "LLM chooses actions and supplies TYPE_TEXT values"
@@ -131,6 +136,7 @@ function render() {
     predicted: "Choice ready · inspect or execute",
     done: "Model reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
+    screenshot_pending: "LLM requested the browser screenshot · approval required",
   };
   $("status").textContent = state.fallback_pending
     ? "Jev made no progress · LLM fallback ready"
@@ -216,6 +222,7 @@ $("task-form").addEventListener("submit", (event) => {
         target_id: $("target").value,
         text_model: $("text-model").value,
         decision_mode: $("decision-mode").value,
+        screenshot_mode: $("auto-screenshot").checked ? "auto" : "approval",
         log_questions: $("log-questions").checked,
       }),
     "Attaching to the selected tab…",
@@ -230,14 +237,21 @@ $("execute").addEventListener("click", () =>
     "Executing the choice…",
   ),
 );
+$("approve-screenshot").addEventListener("click", () =>
+  perform(
+    () => call("approve_screenshot", {fingerprint: state.page.fingerprint}),
+    "Sending the approved screenshot to the LLM…",
+  ),
+);
 $("auto").addEventListener("click", () =>
   perform(async () => {
     automatic = true;
     controls();
-    while (automatic && !["done", "blocked"].includes(state.status)) {
+    while (automatic && !["done", "blocked", "screenshot_pending"].includes(state.status)) {
       $("status").textContent = "Running…";
       if ($("pace").checked) {
         await call("predict", {blocked_indices: blockedIndices()});
+        if (state.status === "screenshot_pending") break;
         await new Promise(resolve => setTimeout(resolve, 450));
         if (!automatic) break;
         await call("act", {fingerprint: state.page.fingerprint});

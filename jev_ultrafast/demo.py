@@ -93,6 +93,9 @@ def command(name, body):
         decision_mode = body.get("decision_mode", "")
         if decision_mode not in {"jev", "jev_fallback", "llm"}:
             raise ValueError("Select a decision engine")
+        screenshot_mode = body.get("screenshot_mode", "")
+        if screenshot_mode not in {"approval", "auto"}:
+            raise ValueError("Select a screenshot sharing mode")
 
         close_browser()
         target = find_tab(body.get("target_id"))
@@ -104,6 +107,7 @@ def command(name, body):
             target_id=target["id"],
             text_model=text_model,
             decision_mode=decision_mode,
+            screenshot_mode=screenshot_mode,
             question_log_dir=(
                 os.environ.get("QUESTION_LOG_DIR", "artifacts/questions")
                 if body.get("log_questions")

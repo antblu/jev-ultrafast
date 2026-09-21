@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from copy import deepcopy
 
 import httpx
 
@@ -158,6 +159,19 @@ def decision_format(model):
     return "tool" if "glm" in lowered or lowered.startswith("zai-org/") else "json"
 
 
+def redact_image_data(body):
+    redacted = deepcopy(body)
+    for message in redacted.get("messages", []):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            image_url = item.get("image_url") if isinstance(item, dict) else None
+            if isinstance(image_url, dict) and str(image_url.get("url", "")).startswith("data:image/"):
+                image_url["url"] = "[screenshot omitted]"
+    return redacted
+
+
 def choose(state, goal, history, *, blocked_indices=(), log_request=None):
     elements, targets, controls = action_space(state["actions"], blocked_indices)
     labels = {
@@ -230,7 +244,7 @@ def choose(state, goal, history, *, blocked_indices=(), log_request=None):
     }
 
 
-def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None):
+def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None, screenshot=None):
     _, targets, controls = action_space(state["actions"], blocked_indices)
     choices = {
         operation: {
@@ -266,6 +280,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
             for item in history[-10:]
         ],
         "rules": [NEXT_ACTION, TARGET],
+        "screenshot_supplied": bool(screenshot),
     }
     key, base, model, reasoning = text_model_config(model)
     output_format = decision_format(model)
@@ -275,7 +290,17 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         **reasoning,
         "messages": [
             {"role": "system", "content": LLM_DECISION},
-            {"role": "user", "content": json.dumps(context)},
+            {
+                "role": "user",
+                "content": (
+                    [
+                        {"type": "text", "text": json.dumps(context)},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot}"}},
+                    ]
+                    if screenshot
+                    else json.dumps(context)
+                ),
+            },
         ],
     }
     if output_format == "tool":
@@ -290,7 +315,17 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "operation": {"type": "string", "enum": list(choices)},
+                                "screenshot_required": (
+                                    {"type": "boolean", "enum": [False]}
+                                    if screenshot
+                                    else {"type": "boolean"}
+                                ),
+                                "operation": {
+                                    "anyOf": [
+                                        {"type": "string", "enum": list(choices)},
+                                        {"type": "null"},
+                                    ]
+                                },
                                 "target": {
                                     "anyOf": [
                                         {"type": "string", "enum": target_ids},
@@ -298,7 +333,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
                                     ]
                                 },
                             },
-                            "required": ["operation", "target"],
+                            "required": ["screenshot_required", "operation", "target"],
                             "additionalProperties": False,
                         },
                     },
@@ -308,8 +343,9 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         )
     else:
         body["response_format"] = {"type": "json_object"}
+    logged_body = redact_image_data(body)
     if log_request:
-        log_request(body)
+        log_request(logged_body)
     started = time.perf_counter()
     result = post_json(base + "/chat/completions", key, body)
     try:
@@ -334,9 +370,34 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
             output = arguments if isinstance(arguments, dict) else json.loads(arguments)
         else:
             output = json.loads(message.get("content") or "")
-        if set(output) != {"operation", "target"}:
+        if not set(output).issubset({"screenshot_required", "operation", "target"}) or not {
+            "operation",
+            "target",
+        }.issubset(output):
+            raise ValueError()
+        screenshot_required = output.get("screenshot_required", False)
+        if not isinstance(screenshot_required, bool):
             raise ValueError()
         operation, target = output["operation"], output["target"]
+        if screenshot_required:
+            if screenshot or operation is not None or target is not None:
+                raise ValueError()
+            return {
+                "choice": None,
+                "operation": None,
+                "target": None,
+                "screenshot_required": True,
+                "confidence": None,
+                "probabilities": {},
+                "operation_probabilities": {},
+                "target_probabilities": {},
+                "target_confidence": None,
+                "raw_answers": output,
+                "model": result.get("model", model),
+                "usage": result.get("usage", {}),
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "request": logged_body,
+            }
         if operation in targets:
             if isinstance(target, int) and not isinstance(target, bool):
                 target = str(target)
@@ -357,6 +418,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         "choice": choice,
         "operation": operation,
         "target": target,
+        "screenshot_required": False,
         "confidence": None,
         "probabilities": {choice: None},
         "operation_probabilities": {},
@@ -366,7 +428,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         "model": result.get("model", model),
         "usage": result.get("usage", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
-        "request": body,
+        "request": logged_body,
     }
 
 

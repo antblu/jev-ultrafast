@@ -45,6 +45,10 @@
             <input name="log-questions" id="log-questions" type="checkbox" />
             Log indexed pages
           </label>
+          <label title="When disabled, the demo pauses for approval before sending an LLM-requested screenshot">
+            <input name="auto-screenshot" id="auto-screenshot" type="checkbox" />
+            Auto-send requested screenshots
+          </label>
           <span id="model-help">LLM used only when Jev chooses TYPE_TEXT</span>
         </div>
         <div class="task-row">
@@ -65,6 +69,7 @@
             Targets</label
           ><button type="button" id="choose" disabled>Choose next</button
           ><button type="button" id="execute" disabled>Execute choice</button
+          ><button type="button" id="approve-screenshot" hidden>Send screenshot</button
           ><button type="button" id="auto" disabled>Run automatically</button
           ><button type="button" id="stop" hidden>Pause</button>
         </div>

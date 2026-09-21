@@ -25,12 +25,15 @@ class Agent:
         text_model=None,
         decision_mode="jev",
         question_log_dir=None,
+        screenshot_mode="approval",
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         if decision_mode not in {"jev", "jev_fallback", "llm"}:
             raise ValueError("Decision mode must be jev, jev_fallback, or llm")
+        if screenshot_mode not in {"approval", "auto"}:
+            raise ValueError("Screenshot mode must be approval or auto")
         plan = [task]
         self.pending_text = None
         self.browser = Browser(
@@ -70,6 +73,8 @@ class Agent:
             question_logging=bool(self.question_log),
             blocked_indices=[],
             fallback_pending=None,
+            screenshot_mode=screenshot_mode,
+            screenshot_pending=None,
         )
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
@@ -123,12 +128,48 @@ class Agent:
             "elements": action_space(self.state["page"]["actions"])[0],
         }
 
+    def _choose_llm_decision(self, decision_engine, fallback_from=None, screenshot=None):
+        state = self.state
+        decision = choose_llm(
+            state["page"],
+            state["goal"],
+            state["history"],
+            model=state.get("text_model"),
+            blocked_indices=state["blocked_indices"],
+            log_request=lambda request: self._log_request(
+                request, f"{decision_engine}_screenshot" if screenshot else decision_engine
+            ),
+            **({"screenshot": screenshot} if screenshot else {}),
+        )
+        if decision.get("screenshot_required"):
+            if screenshot:
+                raise ValueError("LLM requested another screenshot after receiving one; no action executed")
+            pending = {
+                "decision_engine": decision_engine,
+                "fallback_from": fallback_from,
+                "fingerprint": state["page"]["fingerprint"],
+            }
+            if state.get("screenshot_mode") == "approval":
+                state["screenshot_pending"] = pending
+                state["status"] = "screenshot_pending"
+                return None
+            image = state["page"].get("screenshot")
+            if not image:
+                raise ValueError("The LLM requested a screenshot, but this run did not capture one")
+            return self._choose_llm_decision(decision_engine, fallback_from, screenshot=image)
+        decision["decision_engine"] = decision_engine
+        if fallback_from:
+            decision["fallback_from"] = fallback_from
+        return decision
+
     def command(self, name, body=None):
         body = body or {}
         state = self.state
         if name == "tick":
             try:
                 self.command("predict", body)
+                if state["status"] == "screenshot_pending":
+                    return self.snapshot()
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 state["decision"] = None
@@ -162,17 +203,9 @@ class Agent:
             state["fallback_pending"] = None
             if decision_mode == "llm" or fallback_pending:
                 decision_engine = "llm_fallback" if fallback_pending else "llm"
-                state["decision"] = choose_llm(
-                    state["page"],
-                    state["goal"],
-                    state["history"],
-                    model=state.get("text_model"),
-                    blocked_indices=state["blocked_indices"],
-                    log_request=lambda request: self._log_request(request, decision_engine),
-                )
-                state["decision"]["decision_engine"] = decision_engine
-                if fallback_pending:
-                    state["decision"]["fallback_from"] = fallback_pending
+                state["decision"] = self._choose_llm_decision(decision_engine, fallback_pending)
+                if state["decision"] is None:
+                    return self.snapshot()
             else:
                 jev_decision = choose(
                     state["page"],
@@ -182,20 +215,14 @@ class Agent:
                     log_request=lambda request: self._log_request(request, "jev"),
                 )
                 if decision_mode == "jev_fallback" and jev_decision["choice"] == "BLOCKED":
-                    state["decision"] = choose_llm(
-                        state["page"],
-                        state["goal"],
-                        state["history"],
-                        model=state.get("text_model"),
-                        blocked_indices=state["blocked_indices"],
-                        log_request=lambda request: self._log_request(request, "llm_fallback"),
-                    )
-                    state["decision"]["decision_engine"] = "llm_fallback"
-                    state["decision"]["fallback_from"] = {
+                    fallback_from = {
                         "choice": "BLOCKED",
                         "model": jev_decision["model"],
                         "latency_ms": jev_decision["latency_ms"],
                     }
+                    state["decision"] = self._choose_llm_decision("llm_fallback", fallback_from)
+                    if state["decision"] is None:
+                        return self.snapshot()
                 else:
                     state["decision"] = jev_decision
                     state["decision"]["decision_engine"] = "jev"
@@ -203,6 +230,31 @@ class Agent:
                 {
                     **state["decision"],
                     "fingerprint": state["page"]["fingerprint"],
+                    "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+                }
+            )
+            state["status"] = "predicted"
+        elif name == "approve_screenshot":
+            pending = state.get("screenshot_pending")
+            page = state["page"]
+            if not pending or body.get("fingerprint") != pending["fingerprint"]:
+                raise ValueError("No current screenshot request is awaiting approval")
+            if not state["browser"].fresh(page):
+                state["screenshot_pending"] = None
+                state["status"] = "ready"
+                raise StalePage("Page changed before screenshot approval. Choose again.")
+            image = page.get("screenshot")
+            if not image:
+                raise ValueError("No browser screenshot is available for approval")
+            decision = self._choose_llm_decision(
+                pending["decision_engine"], pending.get("fallback_from"), screenshot=image
+            )
+            state["screenshot_pending"] = None
+            state["decision"] = decision
+            state["decisions"].append(
+                {
+                    **decision,
+                    "fingerprint": page["fingerprint"],
                     "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                 }
             )
