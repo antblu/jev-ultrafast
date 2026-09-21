@@ -9,8 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from browser_harness.admin import ensure_daemon
+from browser_harness.helpers import cdp
+
 from .agent import Agent
-from .questions import MAX_STEPS
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
@@ -31,7 +33,13 @@ def load_environment():
 
 def response_state():
     state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
-    return {**state, "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"), "max_steps": MAX_STEPS}
+    return {
+        **state,
+        "text_model": state.get("text_model", default_text_model()),
+        "text_models": text_model_options(),
+        "typesafe_model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+        "tabs": available_tabs(),
+    }
 
 
 def close_browser():
@@ -41,25 +49,72 @@ def close_browser():
         AGENT = None
 
 
+def default_text_model():
+    return os.environ.get("TEXT_MODEL", "deepseek-chat").split(",", 1)[0].strip()
+
+
+def text_model_options():
+    configured = ",".join(
+        [os.environ.get("TEXT_MODEL", "deepseek-chat"), os.environ.get("TEXT_MODEL_OPTIONS", "")]
+    )
+    return list(dict.fromkeys(model.strip() for model in configured.split(",") if model.strip()))
+
+
+def available_tabs():
+    ensure_daemon()
+    targets = cdp("Target.getTargets").get("targetInfos", [])
+    return [
+        {"id": target["targetId"], "title": target.get("title") or "Untitled", "url": target["url"]}
+        for target in targets
+        if target.get("type") == "page"
+        and target.get("url", "").startswith(("http://", "https://"))
+        and not target["url"].startswith(ORIGIN)
+    ]
+
+
+def find_tab(target_id):
+    target = next((tab for tab in available_tabs() if tab["id"] == target_id), None)
+    if target is None:
+        raise ValueError("Select an open browser tab and try again")
+    return target
+
+
 def command(name, body):
     global AGENT
     if name == "reset":
-        scenario = body.get("scenario", "flights")
-        if scenario not in {"travel", "research", "flights"}:
-            raise ValueError("Unknown demo scenario")
         goal = body.get("goal", "").strip()
+
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
+
+        text_model = body.get("text_model", "")
+        if text_model not in text_model_options():
+            raise ValueError("Select a configured text model")
+        decision_mode = body.get("decision_mode", "")
+        if decision_mode not in {"jev", "llm"}:
+            raise ValueError("Select a decision engine")
+
         close_browser()
+        target = find_tab(body.get("target_id"))
+
         AGENT = Agent(
-            "https://www.google.com/travel/flights?hl=en"
-            if scenario == "flights"
-            else f"{ORIGIN}/fixture.html?scenario={scenario}",
+            None,
             goal,
             screenshots=True,
-            record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
+            target_id=target["id"],
+            text_model=text_model,
+            decision_mode=decision_mode,
+            record_dir=(
+                Path.cwd() / "artifacts" / "frames"
+                if body.get("record")
+                else None
+            ),
         )
-        AGENT.state["scenario"] = scenario
+
+        AGENT.state["scenario"] = "attached-tab"
+        AGENT.state["target_id"] = target["id"]
+        AGENT.state["attached_url"] = target["url"]
+
     else:
         if AGENT is None:
             raise ValueError("Start a demo first")
@@ -94,6 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             "/app.js": ("app.js", "text/javascript"),
             "/style.css": ("style.css", "text/css"),
             "/fixture.html": ("fixture.html", "text/html"),
+            "/iframe_fixture.html": ("iframe_fixture.html", "text/html"),
+            "/iframe_content.html": ("iframe_content.html", "text/html"),
         }
         if path not in files:
             return self.send(404, "Not found", "text/plain")

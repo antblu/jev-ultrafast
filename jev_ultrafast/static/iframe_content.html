@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Course content</title>
+    <style>
+      body { margin: 20px; font: 16px sans-serif; }
+      .visually-hidden { position: absolute; opacity: 0; width: 1px; height: 1px; }
+      label, input, select { display: block; margin: 14px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>IPv6 neighbor discovery</h1>
+    <label><input class="visually-hidden" type="checkbox" id="advertisement"> Neighbor advertisement</label>
+    <div role="checkbox" aria-checked="false" aria-labelledby="composite-label">
+      <input class="visually-hidden" type="checkbox" id="composite">
+      <label id="composite-label" for="composite">Composite choice</label>
+    </div>
+    <label><input type="radio" name="message"> Router solicitation</label>
+    <label>Answer <input type="text" aria-label="Course answer"></label>
+    <label>Category
+      <select aria-label="Message category">
+        <option value="all">All</option>
+        <option value="neighbor">Neighbor</option>
+      </select>
+    </label>
+    <div id="shadow-host"></div>
+    <script>
+      const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+      shadow.innerHTML = '<button type="button">Shadow action</button>';
+    </script>
+  </body>
+</html>

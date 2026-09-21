@@ -3,12 +3,6 @@ const token = document.querySelector('meta[name="demo-token"]').content;
 let state = null,
   busy = false,
   automatic = false;
-const goals = {
-  flights: 'Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.',
-  travel: 'Find a Design stay in Lisbon with Free cancellation and open Casa Flora.',
-  research:
-    "Open the article about using finite choices to control browser agents.",
-};
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -17,7 +11,7 @@ const escape = (value) =>
         c
       ],
   );
-const percent = (value) => `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
+const percent = (value) => value == null ? "—" : `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
 async function call(name, body = {}) {
   const response = await fetch(`/api/${name}`, {
     method: "POST",
@@ -33,8 +27,10 @@ async function call(name, body = {}) {
 function controls() {
   const live = state?.page && !["done", "blocked"].includes(state.status);
   $("start").disabled = busy;
-  $("scenario").disabled = busy;
   $("goal").disabled = busy;
+  $("target").disabled = busy;
+  $("decision-mode").disabled = busy;
+  $("text-model").disabled = busy;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
   $("auto").disabled = busy || !live;
@@ -66,8 +62,32 @@ async function perform(fn, label) {
     controls();
   }
 }
+function renderSelectors() {
+  const selectedTarget = state?.target_id || $("target").value;
+  $("target").innerHTML = (state?.tabs || []).length
+    ? state.tabs.map((tab) =>
+        `<option value="${escape(tab.id)}">${escape(tab.title)} · ${escape(tab.url)}</option>`
+      ).join("")
+    : '<option value="">No eligible browser tabs found</option>';
+  if ([...$("target").options].some((option) => option.value === selectedTarget)) {
+    $("target").value = selectedTarget;
+  }
+  $("text-model").innerHTML = (state?.text_models || []).map((model) =>
+    `<option value="${escape(model)}">${escape(model)}</option>`
+  ).join("");
+  $("text-model").value = state?.text_model || $("text-model").options[0]?.value || "";
+  $("decision-mode").value = state?.decision_mode || $("decision-mode").value || "jev";
+  const llmDecision = $("decision-mode").value === "llm";
+  $("model-help").textContent = llmDecision
+    ? "LLM chooses actions and supplies TYPE_TEXT values"
+    : "LLM used only when Jev chooses TYPE_TEXT";
+}
 function render() {
   if (!state) return;
+  renderSelectors();
+  const llmMode = state.decision_mode === "llm";
+  $("choice-model").textContent = llmMode ? `LLM · ${state.text_model}` : state.typesafe_model;
+  $("text-model-tag").textContent = llmMode ? "decisions + text" : `${state.text_model} text helper`;
   $("helper").textContent = `Text helper · ${state.text_model}`;
   $("plan").innerHTML = (state.plan || [])
     .map(
@@ -83,7 +103,7 @@ function render() {
     idle: "Ready to explore",
     ready: "Page observed · ready for a decision",
     predicted: "Choice ready · inspect or execute",
-    done: "Jev reports complete · inspect the page",
+    done: "Model reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
   };
   $("status").textContent = labels[state.status] || state.status;
@@ -92,6 +112,7 @@ function render() {
     return;
   }
   $("empty").hidden = true;
+  $("viewport").style.aspectRatio = `${page.w} / ${page.h}`;
   $("screenshot").hidden = false;
   $("screenshot").src = `data:image/jpeg;base64,${page.screenshot}`;
   $("url").textContent = page.url;
@@ -104,10 +125,14 @@ function render() {
   $("latency").textContent = d ? `${d.latency_ms} ms` : "—";
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
   $("completion").textContent = d ? d.operation : "—";
-  $("ranking-note").textContent = d ? "Ranked by Jev" : "Unranked";
+  $("ranking-note").textContent = d
+    ? state.decision_mode === "llm" ? "Chosen by LLM" : "Ranked by Jev"
+    : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
-  $("operation-choices").innerHTML = op.map(([name,p]) =>
-    `<span class="operation-choice ${name === d.operation ? 'best' : ''}">${escape(name)} <b>${percent(p)}</b></span>`).join('');
+  $("operation-choices").innerHTML = op.length
+    ? op.map(([name,p]) =>
+        `<span class="operation-choice ${name === d.operation ? 'best' : ''}">${escape(name)} <b>${percent(p)}</b></span>`).join('')
+    : d ? `<span class="operation-choice best">${escape(d.operation)}</span>` : "";
   const probability = e => d?.target_probabilities[e.index] ??
     Math.max(-1, ...(e.options || []).map(o=>d?.target_probabilities[o.index] ?? -1));
   const selectedIndex = d?.target?.split(':')[0];
@@ -118,7 +143,10 @@ function render() {
     return `<div class="choice ${selectedIndex === e.index ? 'best' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${p >= 0 ? percent(p) : '—'}</span></div>`;
   }).join('');
   const targets = new Map();
-  for (const a of page.actions) if (a.rect && !targets.has(a.node)) targets.set(a.node, a);
+  for (const a of page.actions) {
+    const key = `${a.frame_id || 'f0'}:${a.node}`;
+    if (a.rect && !targets.has(key)) targets.set(key, a);
+  }
   $("targets").innerHTML = [...targets.values()].map((a,i) => {
     const index=String(i+1);
     return `<div class="target ${index === selectedIndex ? 'selected' : ''}" data-action="${index}" style="left:${100*a.rect.x/page.w}%;top:${100*a.rect.y/page.h}%;width:${100*a.rect.w/page.w}%;height:${100*a.rect.h/page.h}%"><span>${index}</span></div>`;
@@ -138,7 +166,7 @@ function render() {
       goal: state.goal,
       url: page.url,
       text: page.text,
-      actions: page.actions.map(({ rect, node, ...rest }) => rest),
+      actions: page.actions.map(({ rect, node, frame_id, ...rest }) => rest),
     },
     null,
     2,
@@ -150,12 +178,14 @@ $("task-form").addEventListener("submit", (event) => {
   automatic = false;
   perform(
     () =>
-      call("reset", { scenario: $("scenario").value, goal: $("goal").value }),
-    "Opening a fresh browser…",
+      call("reset", {
+        goal: $("goal").value,
+        target_id: $("target").value,
+        text_model: $("text-model").value,
+        decision_mode: $("decision-mode").value,
+      }),
+    "Attaching to the selected tab…",
   );
-});
-$("scenario").addEventListener("change", () => {
-  $("goal").value = goals[$("scenario").value];
 });
 $("choose").addEventListener("click", () =>
   perform(() => call("predict"), "Jev is comparing the actions…"),
@@ -170,7 +200,7 @@ $("auto").addEventListener("click", () =>
   perform(async () => {
     automatic = true;
     controls();
-    for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
+    while (automatic && !["done", "blocked"].includes(state.status)) {
       $("status").textContent = "Running…";
       if ($("pace").checked) {
         await call("predict");
@@ -180,7 +210,6 @@ $("auto").addEventListener("click", () =>
       } else {
         await call("tick");
       }
-      if (["done", "blocked"].includes(state.status)) break;
     }
     automatic = false;
   }, "Running the browser…"),
@@ -192,6 +221,11 @@ $("stop").addEventListener("click", () => {
 });
 $("overlays").addEventListener("change", () => {
   $("targets").hidden = !$("overlays").checked;
+});
+$("decision-mode").addEventListener("change", () => {
+  $("model-help").textContent = $("decision-mode").value === "llm"
+    ? "LLM chooses actions and supplies TYPE_TEXT values"
+    : "LLM used only when Jev chooses TYPE_TEXT";
 });
 $("choices").addEventListener("pointerover", (event) => {
   const id = event.target.closest("[data-action]")?.dataset.action;

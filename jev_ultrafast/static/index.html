@@ -21,26 +21,31 @@
           <p class="eyebrow">A BROWSER THAT CHOOSES</p>
           <h1>Every page is a set of possibilities.</h1>
           <p>
-            Jev picks the next action. A small language model handles the words.
+            Choose Jev or an OpenAI-compatible LLM to pick the next action.
             <a href="/demo.mp4" target="_blank" rel="noopener">Watch the real Google Flights run ↗</a>
           </p>
         </div>
-        <div class="model-tag">jev-latest <span>+ text helper</span></div>
+        <div class="model-tag"><span id="choice-model">Jev</span> <span>+ <span id="text-model-tag">text helper</span></span></div>
       </section>
       <form id="task-form">
         <div class="task-label">
-          <label for="goal">Give it a task</label
-          ><select id="scenario" name="scenario" aria-label="Demo scenario">
-            <option value="flights">Google Flights · real web</option>
-            <option value="travel">Travel planner · fixture</option>
-            <option value="research">Reading room · fixture</option>
-          </select>
+          <label for="goal">Give the selected browser tab a task</label>
+        </div>
+        <div class="task-options">
+          <label>Browser tab <select id="target" name="target" required></select></label>
+          <label>Decision engine
+            <select id="decision-mode" name="decision-mode" required>
+              <option value="jev">TypeSafe Jev</option>
+              <option value="llm">Selected LLM</option>
+            </select>
+          </label>
+          <label>LLM model <select id="text-model" name="text-model" required></select></label>
+          <span id="model-help">LLM used only when Jev chooses TYPE_TEXT</span>
         </div>
         <div class="task-row">
-          <textarea id="goal" name="goal" rows="5">
-Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.</textarea
-          ><button type="submit" id="start" class="primary">
-            Start demo <span>↗</span>
+          <textarea id="goal" name="goal" rows="5" placeholder="Describe one goal for the selected page." required></textarea>
+          <button type="submit" id="start" class="primary">
+            Attach and start <span>↗</span>
           </button>
         </div>
       </form>
@@ -116,7 +121,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
             <p class="muted">Available actions will appear here.</p>
           </div>
           <p class="aside-note">
-            Operation and target are separate choices in one request.<br />Text is generated only for TYPE_TEXT.
+            The decision engine selects one observed operation and target.<br />TYPE_TEXT makes a separate LLM call for the field value.
           </p>
         </aside>
       </section>

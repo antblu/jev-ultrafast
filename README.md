@@ -63,9 +63,17 @@ uv run jev
 
 Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. The inspector shows numbered elements, operation probabilities, target probabilities, and executed actions. **Choose next** pauses before execution.
 
+The demo has two decision engines. **TypeSafe Jev** is the default and produces operation and target distributions in one request. **Selected LLM** uses the configured OpenAI-compatible model instead: **Choose next** asks it for exactly one offered operation and indexed target, **Execute choice** runs that observed action through the same freshness and safety checks, and **Run automatically** repeats both phases. The LLM never supplies selectors, coordinates, or executable code. Screenshots remain inspector-only; both engines consume the structured page state.
+
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
-`TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
+`TYPESAFE_MODEL` chooses the default Jev model. `TEXT_MODEL_API_KEY`, `TEXT_MODEL_BASE_URL`, `TEXT_MODEL`, and `TEXT_MODEL_REASONING` configure the OpenAI-compatible LLM. In Jev mode that LLM is called only for `TYPE_TEXT`; in LLM decision mode it also selects actions. The demo lists the default plus comma-separated `TEXT_MODEL_OPTIONS`, so several compatible models can be selected per run without exposing credentials to the browser. The example configuration uses OpenRouter and `inception/mercury-2.5` with reasoning disabled.
+
+`LLM_DECISION_MAX_TOKENS` defaults to 1024 and `TEXT_VALUE_MAX_TOKENS` defaults to 1024. These limits include reasoning tokens on providers that expose reasoning separately. If a reasoning model reaches the decision limit before emitting JSON, the demo stops without executing and reports which setting to increase.
+
+`LLM_DECISION_FORMAT` defaults to `auto`. It uses a forced `choose_action` function for GLM/Z.ai models, whose OpenAI-compatible providers may not preserve JSON response-format constraints, and JSON-object mode for other models. Set it explicitly to `tool` or `json` when a provider needs an override. Function arguments still pass through the same observed-operation and target validation before execution.
+
+`MODEL_TIMEOUT_SECONDS` defaults to 60 seconds per attempt. Transient connection errors, read timeouts, rate limits, and retryable 5xx responses are retried up to three times with short exponential backoff. Model requests are read-only; browser mutations are still never retried.
 
 ## Use the library
 
@@ -123,7 +131,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this MVP. Owned tabs share the existing Chrome profile.
+A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, including open shadow roots and visible same-origin iframes up to four levels deep, but not the full accessible-name specification. Closed shadow roots, cross-origin frames, canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this MVP. Owned tabs share the existing Chrome profile.
 
 ## Development
 

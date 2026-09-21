@@ -1,22 +1,38 @@
 """The complete agent loop. Typed choices, observable state, bounded execution."""
 
 import base64
+import os
 import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, choose, choose_llm, field_context, field_text
 from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(
+        self,
+        url,
+        goals,
+        *,
+        record_dir=None,
+        screenshots=False,
+        target_id=None,
+        text_model=None,
+        decision_mode="jev",
+    ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
+        if decision_mode not in {"jev", "llm"}:
+            raise ValueError("Decision mode must be jev or llm")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url)
+        self.browser = Browser(
+            url,
+            target_id=target_id,
+        )
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -35,6 +51,8 @@ class Agent:
             plan_index=0,
             decisions=[],
             text_calls=[],
+            text_model=text_model or os.environ.get("TEXT_MODEL", "deepseek-chat").split(",", 1)[0].strip(),
+            decision_mode=decision_mode,
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
@@ -72,9 +90,12 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
-                raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            if state.get("decision_mode", "jev") == "llm":
+                state["decision"] = choose_llm(
+                    state["page"], state["goal"], state["history"], model=state.get("text_model")
+                )
+            else:
+                state["decision"] = choose(state["page"], state["goal"], state["history"])
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -110,7 +131,7 @@ class Agent:
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
-                    text, helper = field_text(context)
+                    text, helper = field_text(context, model=state.get("text_model"))
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
@@ -124,7 +145,7 @@ class Agent:
                     "action": action["label"],
                     "kind": action["kind"],
                     "choice": selected,
-                    "probability": decision["probabilities"][selected],
+                    "probability": decision["probabilities"].get(selected),
                     "confidence": decision["confidence"],
                     "latency_ms": decision["latency_ms"],
                     "text": text,

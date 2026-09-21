@@ -6,6 +6,8 @@ One TypeSafe request asks which operation to perform and which target would be a
 
 Operation and target questions receive the same next-step rules. Target criteria include current values and checked/selected state. The questions run independently: a target cannot read the operation answer, so its premise explicitly names the operation it assumes.
 
+The demo can instead use the selected OpenAI-compatible LLM as its decision engine. It receives the same structured page state and an enumerated operation/target vocabulary, then must return JSON naming exactly one offered operation and target. Invalid, invented, or mismatched targets stop before execution. This mode does not send screenshots and cannot emit selectors, coordinates, or executable code.
+
 TYPE_TEXT sends the goal, selected field, visible page context, and recent actions to a small LLM. Its JSON must contain exactly one valid `text` value. The code does not extract quoted literals. A value can be reused after a stale decision only while the entire helper input is identical, and is discarded after a successful mutation.
 
 ## Runtime
@@ -28,6 +30,6 @@ The audit also found that treating every INPUT as editable misclassified checkbo
 
 ## Boundaries
 
-Sixty browser actions and 120 decision requests bound a run. Up to 250 action candidates are retained; truncated candidates cannot be selected. The service stays loopback-only, serializes inspector actions, and checks Host, Origin, and a local request token. Credentials remain server-side. Tabs share the existing Chrome profile.
+Sixty browser actions bound a run. Up to 250 action candidates are retained; truncated candidates cannot be selected. The service stays loopback-only, serializes inspector actions, and checks Host, Origin, and a local request token. Credentials remain server-side. Tabs share the existing Chrome profile.
 
-The policy is generic, but two websites do not establish broad reliability. Name resolution covers common labels, ARIA references, and text; it is not the browser's full accessibility algorithm. Shadow roots, frames, canvas, uploads, nested scrolling, pop-ups, and complex keyboard interactions can block progress. A valid action can still be wrong. Independent checks, rather than the model's DONE choice, determine whether the demonstrated task succeeded.
+The policy is generic, but two websites do not establish broad reliability. Name resolution covers common labels, ARIA references, and text; it is not the browser's full accessibility algorithm. Open shadow roots and visible same-origin iframes are scanned to a bounded depth; closed shadow roots, cross-origin frames, canvas, uploads, nested scrolling, pop-ups, and complex keyboard interactions can block progress. A valid action can still be wrong. Independent checks, rather than the model's DONE choice, determine whether the demonstrated task succeeded.

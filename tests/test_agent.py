@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from jev_ultrafast import agent as loop
@@ -31,6 +32,26 @@ def page():
 
 def choice(ids, selected):
     return {"choice": selected, "confidence": 1.0, "probabilities": {i: float(i == selected) for i in ids}}
+
+
+def test_model_transport_retries_a_read_timeout(monkeypatch):
+    response = Mock(status_code=200, is_error=False)
+    response.json.return_value = {"ok": True}
+    client = Mock()
+    client.post.side_effect = [httpx.ReadTimeout("slow response"), response]
+    monkeypatch.setattr(model, "CLIENT", client)
+    monkeypatch.setattr(model.time, "sleep", Mock())
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "75")
+    assert model.post_json("https://model.test", "secret", {"input": "state"}) == {"ok": True}
+    assert client.post.call_count == 2
+    assert client.post.call_args.kwargs["timeout"] == 75
+
+
+def test_model_timeout_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "999")
+    assert model.model_timeout() == 300
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "invalid")
+    assert model.model_timeout() == 60
 
 
 def decision(action="e1"):
@@ -72,6 +93,16 @@ def test_one_index_per_node_with_operation_specific_targets():
     assert targets["CLICK"]["1"]["id"] == "e2"
     assert targets["CLICK"]["2"]["id"] == "e3"
     assert "WAIT" in controls
+
+
+def test_frame_local_node_ids_get_distinct_global_indices():
+    actions = [
+        {"id": "e1", "kind": "click", "label": "Outer", "role": "button", "node": 1, "frame_id": "f0"},
+        {"id": "e2", "kind": "click", "label": "Inner", "role": "button", "node": 1, "frame_id": "f1"},
+    ]
+    elements, targets, _ = model.action_space(actions)
+    assert [element["label"] for element in elements] == ["Outer", "Inner"]
+    assert set(targets["CLICK"]) == {"1", "2"}
 
 
 def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
@@ -140,6 +171,94 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
     assert d["choice"] == "e3"
 
 
+def test_llm_mode_chooses_only_an_observed_operation_and_target(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(
+        return_value={
+            "model": "provider/decision-model",
+            "choices": [{"message": {"content": '{"operation":"CLICK","target":2}'}}],
+        }
+    )
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(page(), "Submit the search", [], model="provider/decision-model")
+    assert result["choice"] == "e3"
+    assert result["operation"] == "CLICK"
+    assert result["target"] == "2"
+    sent = json.loads(post.call_args.args[2]["messages"][1]["content"])
+    assert set(sent["choices"]["CLICK"]) == {"1", "2"}
+
+
+def test_llm_mode_rejects_an_invented_target(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(return_value={"choices": [{"message": {"content": '{"operation":"CLICK","target":"999"}'}}]}),
+    )
+    with pytest.raises(ValueError, match="valid observed action"):
+        model.choose_llm(page(), "Submit the search", [])
+
+
+def test_llm_mode_reports_truncated_reasoning_before_json(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        Mock(
+            return_value={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": "Still reasoning"},
+                    }
+                ]
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="LLM_DECISION_MAX_TOKENS"):
+        model.choose_llm(page(), "Submit the search", [])
+
+
+def test_glm_decisions_use_forced_function_calling(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(
+        return_value={
+            "model": "zai-org/GLM-5.3-Flash",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "choose_action",
+                                    "arguments": '{"operation":"CLICK","target":"2"}',
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(page(), "Submit the search", [], model="zai-org/GLM-5.3-Flash")
+    assert result["choice"] == "e3"
+    body = post.call_args.args[2]
+    assert body["tool_choice"]["function"]["name"] == "choose_action"
+    assert body["tools"][0]["function"]["parameters"]["additionalProperties"] is False
+    assert "response_format" not in body
+
+
+def test_llm_decision_budget_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setenv("LLM_DECISION_MAX_TOKENS", "2048")
+    assert model.token_budget("LLM_DECISION_MAX_TOKENS", 1024) == 2048
+    monkeypatch.setenv("LLM_DECISION_MAX_TOKENS", "999999")
+    assert model.token_budget("LLM_DECISION_MAX_TOKENS", 1024) == 8192
+
+
 def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
@@ -149,6 +268,23 @@ def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     assert post.call_count == 1
     sent = json.loads(post.call_args.args[2]["messages"][1]["content"])
     assert sent["goal"] == 'Fly from "Zurich" to London'
+
+
+def test_selected_text_model_is_sent_to_the_helper(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    model.field_text({"goal": "Enter Zurich"}, model="provider/selected-model")
+    assert post.call_args.args[2]["model"] == "provider/selected-model"
+
+
+def test_demo_accepts_comma_separated_model_choices(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.setenv("TEXT_MODEL", "provider/default,provider/second")
+    monkeypatch.setenv("TEXT_MODEL_OPTIONS", "provider/second,provider/third")
+    assert demo.default_text_model() == "provider/default"
+    assert demo.text_model_options() == ["provider/default", "provider/second", "provider/third"]
 
 
 def test_missing_text_credential_stops_before_guessing(monkeypatch):
@@ -249,6 +385,19 @@ def test_executor_rejects_a_stale_page_before_browser_input(monkeypatch):
     with pytest.raises(StalePage):
         b.act(page()["actions"][0], page(), "book")
     operation.assert_not_called()
+
+
+def test_agent_predict_dispatches_to_the_selected_llm_mode(runner, monkeypatch):
+    runner.state.update(status="ready", decision=None, decision_mode="llm", text_model="provider/selected")
+    llm_decision = decision("e3")
+    llm_decision.update(operation="CLICK", target="2")
+    llm = Mock(return_value=llm_decision)
+    jev = Mock()
+    monkeypatch.setattr(loop, "choose_llm", llm)
+    monkeypatch.setattr(loop, "choose", jev)
+    runner.command("predict")
+    llm.assert_called_once_with(page(), "Find a book", [], model="provider/selected")
+    jev.assert_not_called()
 
 
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])

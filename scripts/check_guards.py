@@ -1,5 +1,6 @@
 """Local-browser freshness/execution regressions. No model calls or external websites."""
 
+from html import escape
 from urllib.parse import quote
 
 from jev_ultrafast.browser import Browser, StalePage
@@ -12,6 +13,30 @@ HTML = """<!doctype html><title>Guard checks</title>
 <label><input id="toggle" type="checkbox">Refundable</label>
 <select aria-label="Category"><option>All</option><option>Design</option></select>
 <p id="outside">Unrelated offscreen text</p>"""
+
+FRAME_CONTENT = """<!doctype html><style>
+body{margin:20px}.hidden-control{position:absolute;opacity:0;width:1px;height:1px}
+label,input,select{display:block;margin:12px}
+</style><h1>IPv6 question</h1>
+<label><input class="hidden-control" id="answer" type="checkbox">Neighbor advertisement</label>
+<div role="checkbox" aria-checked="false" aria-labelledby="composite-label">
+  <input class="hidden-control" id="composite" type="checkbox">
+  <label id="composite-label" for="composite">Composite choice</label>
+</div>
+<label><input type="radio" name="message">Router solicitation</label>
+<input aria-label="Course answer">
+<select aria-label="Category"><option>All</option><option>Neighbor</option></select>
+<div id="shadow-host"></div><script>
+const shadow=document.querySelector('#shadow-host').attachShadow({mode:'open'});
+shadow.innerHTML='<button id="shadow-action">Shadow action</button>';
+shadow.querySelector('button').onclick=()=>window.shadowClicks=(window.shadowClicks||0)+1;
+</script>"""
+FRAME_PAGE = f"""<!doctype html><style>
+body{{margin:20px}}iframe{{display:block;width:600px;height:300px;margin:30px 0 0 70px;border:4px solid}}
+#hidden{{display:none}}
+</style><button>Outer button</button>
+<iframe title="Course content" srcdoc="{escape(FRAME_CONTENT, quote=True)}"></iframe>
+<iframe id="hidden" srcdoc="<button>Hidden auth action</button>"></iframe>"""
 
 
 def main():
@@ -124,6 +149,60 @@ def main():
         assert value == "Generated", repr(value)
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
+
+        browser.call("Page.navigate", url="data:text/html," + quote(FRAME_PAGE))
+        for _ in range(100):
+            if browser.evaluate("document.querySelector('iframe')?.contentDocument?.readyState") == "complete":
+                break
+        page = browser.observe(screenshot=False)
+        labels = [action["label"] for action in page["actions"]]
+        assert labels.count("Neighbor advertisement") == 1
+        assert labels.count("Composite choice") == 1
+        assert labels.count("Router solicitation") == 1
+        assert "Course answer" in labels and "Shadow action" in labels
+        assert "Hidden auth action" not in labels
+        inner = next(a for a in page["actions"] if a["label"] == "Neighbor advertisement")
+        outer = next(a for a in page["actions"] if a["label"] == "Outer button")
+        assert inner["frame_id"] != outer["frame_id"]
+        assert inner["rect"]["x"] > 70 and inner["rect"]["y"] > 30
+        assert "IPv6 question" in page["text"]
+        passed.append("visible same-origin frame merges controls, text, and translated geometry once")
+
+        browser.act(inner, page)
+        checked = browser.evaluate("document.querySelector('iframe').contentDocument.querySelector('#answer').checked")
+        assert checked is True
+        passed.append("label-backed iframe checkbox clicks through top-page coordinates")
+
+        page = browser.observe(screenshot=False)
+        shadow_action = next(a for a in page["actions"] if a["label"] == "Shadow action")
+        browser.act(shadow_action, page)
+        assert browser.evaluate("document.querySelector('iframe').contentWindow.shadowClicks") == 1
+        passed.append("iframe shadow-root control passes deep hit testing and clicks")
+
+        page = browser.observe(screenshot=False)
+        field = next(a for a in page["actions"] if a["kind"] == "fill" and a["label"] == "Course answer")
+        browser.act(field, page, text="neighbor")
+        browser.observe(screenshot=False)
+        value = browser.evaluate(
+            "document.querySelector('iframe').contentDocument"
+            ".querySelector('[aria-label=\"Course answer\"]').value"
+        )
+        assert value == "neighbor"
+        passed.append("iframe text entry uses the frame-local node cache")
+
+        page = browser.observe(screenshot=False)
+        select = next(a for a in page["actions"] if a["kind"] == "select" and a["value"] == "Neighbor")
+        browser.act(select, page)
+        value = browser.evaluate("document.querySelector('iframe').contentDocument.querySelector('select').value")
+        assert value == "Neighbor"
+        passed.append("iframe dropdown uses the frame-local node cache")
+
+        page = browser.observe(screenshot=False)
+        radio = next(a for a in page["actions"] if a["label"] == "Router solicitation")
+        browser.evaluate("document.querySelector('iframe').contentDocument.querySelector('input[type=radio]').checked=true")
+        assert not browser.fresh(page, radio)
+        passed.append("iframe semantic changes invalidate frame-aware freshness guards")
+
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

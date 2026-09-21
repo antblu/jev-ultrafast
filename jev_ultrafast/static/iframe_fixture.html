@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Same-origin iframe fixture</title>
+    <style>
+      body { margin: 24px; font: 16px sans-serif; }
+      iframe { display: block; width: 620px; height: 320px; margin: 36px 0 0 80px; border: 4px solid #777; }
+      #hidden-auth { display: none; }
+    </style>
+  </head>
+  <body>
+    <button type="button">Outer button</button>
+    <iframe title="Course content" src="iframe_content.html"></iframe>
+    <iframe id="hidden-auth" title="Hidden auth" src="iframe_content.html"></iframe>
+  </body>
+</html>
