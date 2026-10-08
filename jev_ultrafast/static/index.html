@@ -36,7 +36,6 @@
           <label>Decision engine
             <select id="decision-mode" name="decision-mode" required>
               <option value="jev">TypeSafe Jev</option>
-              <option value="jev_fallback">Jev with LLM fallback</option>
               <option value="llm">Selected LLM</option>
             </select>
           </label>
@@ -44,10 +43,6 @@
           <label title="Writes page text, indexed elements, and model questions to the server-side log directory">
             <input name="log-questions" id="log-questions" type="checkbox" />
             Log indexed pages
-          </label>
-          <label title="When disabled, the demo pauses for approval before sending an LLM-requested screenshot">
-            <input name="auto-screenshot" id="auto-screenshot" type="checkbox" />
-            Auto-send requested screenshots
           </label>
           <span id="model-help">LLM used only when Jev chooses TYPE_TEXT</span>
         </div>
@@ -69,7 +64,6 @@
             Targets</label
           ><button type="button" id="choose" disabled>Choose next</button
           ><button type="button" id="execute" disabled>Execute choice</button
-          ><button type="button" id="approve-screenshot" hidden>Send screenshot</button
           ><button type="button" id="auto" disabled>Run automatically</button
           ><button type="button" id="stop" hidden>Pause</button>
         </div>

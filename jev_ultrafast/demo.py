@@ -13,6 +13,7 @@ from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
 from .agent import Agent
+from .model import model_catalog
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
@@ -37,6 +38,8 @@ def response_state():
         **state,
         "text_model": state.get("text_model", default_text_model()),
         "text_models": text_model_options(),
+        "model_capabilities": {name: {"image_compatible": settings["image_compatible"]}
+                               for name, settings in model_catalog().items()},
         "typesafe_model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "tabs": available_tabs(),
     }
@@ -54,10 +57,7 @@ def default_text_model():
 
 
 def text_model_options():
-    configured = ",".join(
-        [os.environ.get("TEXT_MODEL", "deepseek-chat"), os.environ.get("TEXT_MODEL_OPTIONS", "")]
-    )
-    return list(dict.fromkeys(model.strip() for model in configured.split(",") if model.strip()))
+    return list(model_catalog())
 
 
 def available_tabs():
@@ -91,12 +91,8 @@ def command(name, body):
         if text_model not in text_model_options():
             raise ValueError("Select a configured text model")
         decision_mode = body.get("decision_mode", "")
-        if decision_mode not in {"jev", "jev_fallback", "llm"}:
+        if decision_mode not in {"jev", "llm"}:
             raise ValueError("Select a decision engine")
-        screenshot_mode = body.get("screenshot_mode", "")
-        if screenshot_mode not in {"approval", "auto"}:
-            raise ValueError("Select a screenshot sharing mode")
-
         close_browser()
         target = find_tab(body.get("target_id"))
 
@@ -107,7 +103,6 @@ def command(name, body):
             target_id=target["id"],
             text_model=text_model,
             decision_mode=decision_mode,
-            screenshot_mode=screenshot_mode,
             question_log_dir=(
                 os.environ.get("QUESTION_LOG_DIR", "artifacts/questions")
                 if body.get("log_questions")

@@ -127,12 +127,43 @@ def filter_blocked_actions(actions, blocked_indices):
     return filtered
 
 
+def model_catalog():
+    """Resolve server-side model settings; credentials are environment references only."""
+    names = ",".join([os.environ.get("TEXT_MODEL", "deepseek-chat"), os.environ.get("TEXT_MODEL_OPTIONS", "")])
+    catalog = {name.strip(): {"image_compatible": False} for name in names.split(",") if name.strip()}
+    try:
+        configured = json.loads(os.environ.get("MODEL_CONFIG", "{}"))
+        if not isinstance(configured, dict):
+            raise ValueError()
+        for name, settings in configured.items():
+            if not isinstance(name, str) or not name or not isinstance(settings, dict):
+                raise ValueError()
+            if set(settings) - {"image_compatible", "base_url", "api_key_env"}:
+                raise ValueError()
+            if not isinstance(settings.get("image_compatible", False), bool):
+                raise ValueError()
+            for key in ("base_url", "api_key_env"):
+                if key in settings and (not isinstance(settings[key], str) or not settings[key]):
+                    raise ValueError()
+            catalog[name] = {"image_compatible": False, **settings}
+    except (ValueError, TypeError):
+        raise ValueError("MODEL_CONFIG must map model names to valid provider and image settings") from None
+    return catalog
+
+
+def model_settings(model=None):
+    name = model or os.environ.get("TEXT_MODEL", "deepseek-chat").split(",", 1)[0].strip()
+    return model_catalog().get(name, {"image_compatible": False})
+
+
 def text_model_config(model=None):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
-    if not key:
-        raise ValueError("The selected LLM needs TEXT_MODEL_API_KEY; no action executed.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     model = model or os.environ.get("TEXT_MODEL", "deepseek-chat").split(",", 1)[0].strip()
+    settings = model_settings(model)
+    key_env = settings.get("api_key_env", "TEXT_MODEL_API_KEY")
+    key = os.environ.get(key_env)
+    if not key:
+        raise ValueError(f"The selected LLM needs {key_env}; no action executed.")
+    base = settings.get("base_url", os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1")).rstrip("/")
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {
         "reasoning": {"effort": "low"}
     }
@@ -244,7 +275,11 @@ def choose(state, goal, history, *, blocked_indices=(), log_request=None):
     }
 
 
-def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None, screenshot=None):
+def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None):
+    image_compatible = model_settings(model)["image_compatible"]
+    screenshot = state.get("screenshot") if image_compatible else None
+    if image_compatible and not screenshot:
+        raise ValueError("Image-compatible model requires a current browser image; no action executed")
     _, targets, controls = action_space(state["actions"], blocked_indices)
     choices = {
         operation: {
@@ -315,11 +350,6 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "screenshot_required": (
-                                    {"type": "boolean", "enum": [False]}
-                                    if screenshot
-                                    else {"type": "boolean"}
-                                ),
                                 "operation": {
                                     "anyOf": [
                                         {"type": "string", "enum": list(choices)},
@@ -333,7 +363,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
                                     ]
                                 },
                             },
-                            "required": ["screenshot_required", "operation", "target"],
+                            "required": ["operation", "target"],
                             "additionalProperties": False,
                         },
                     },
@@ -370,34 +400,9 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
             output = arguments if isinstance(arguments, dict) else json.loads(arguments)
         else:
             output = json.loads(message.get("content") or "")
-        if not set(output).issubset({"screenshot_required", "operation", "target"}) or not {
-            "operation",
-            "target",
-        }.issubset(output):
-            raise ValueError()
-        screenshot_required = output.get("screenshot_required", False)
-        if not isinstance(screenshot_required, bool):
+        if not isinstance(output, dict) or set(output) != {"operation", "target"}:
             raise ValueError()
         operation, target = output["operation"], output["target"]
-        if screenshot_required:
-            if screenshot or operation is not None or target is not None:
-                raise ValueError()
-            return {
-                "choice": None,
-                "operation": None,
-                "target": None,
-                "screenshot_required": True,
-                "confidence": None,
-                "probabilities": {},
-                "operation_probabilities": {},
-                "target_probabilities": {},
-                "target_confidence": None,
-                "raw_answers": output,
-                "model": result.get("model", model),
-                "usage": result.get("usage", {}),
-                "latency_ms": round((time.perf_counter() - started) * 1000),
-                "request": logged_body,
-            }
         if operation in targets:
             if isinstance(target, int) and not isinstance(target, bool):
                 target = str(target)
@@ -418,7 +423,6 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         "choice": choice,
         "operation": operation,
         "target": target,
-        "screenshot_required": False,
         "confidence": None,
         "probabilities": {choice: None},
         "operation_probabilities": {},

@@ -42,20 +42,16 @@ async function call(name, body = {}) {
   return data;
 }
 function controls() {
-  const screenshotPending = state?.status === "screenshot_pending";
-  const live = state?.page && !["done", "blocked", "screenshot_pending"].includes(state.status);
+  const live = state?.page && !["done", "blocked"].includes(state.status);
   $("start").disabled = busy;
   $("goal").disabled = busy;
   $("target").disabled = busy;
   $("decision-mode").disabled = busy;
   $("text-model").disabled = busy;
   $("log-questions").disabled = busy;
-  $("auto-screenshot").disabled = busy;
   $("block-range").disabled = busy || !state?.page;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
-  $("approve-screenshot").disabled = busy || !screenshotPending;
-  $("approve-screenshot").hidden = !screenshotPending;
   $("auto").disabled = busy || !live;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
@@ -96,29 +92,25 @@ function renderSelectors() {
     $("target").value = selectedTarget;
   }
   $("text-model").innerHTML = (state?.text_models || []).map((model) =>
-    `<option value="${escape(model)}">${escape(model)}</option>`
+    `<option value="${escape(model)}">${escape(model)}${state.model_capabilities?.[model]?.image_compatible ? " · Images" : " · Text only"}</option>`
   ).join("");
   $("text-model").value = state?.text_model || $("text-model").options[0]?.value || "";
   $("decision-mode").value = state?.decision_mode || $("decision-mode").value || "jev";
-  if (state?.screenshot_mode) $("auto-screenshot").checked = state.screenshot_mode === "auto";
   const selectedMode = $("decision-mode").value;
   $("model-help").textContent = selectedMode === "llm"
     ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : selectedMode === "jev_fallback"
-      ? "Jev chooses first; LLM retries one decision when Jev returns BLOCKED"
-      : "LLM used only when Jev chooses TYPE_TEXT";
+    : "LLM used only when Jev chooses TYPE_TEXT";
 }
 function render() {
   if (!state) return;
   renderSelectors();
   const llmMode = state.decision_mode === "llm";
-  const fallbackMode = state.decision_mode === "jev_fallback";
   $("choice-model").textContent = llmMode
     ? `LLM · ${state.text_model}`
-    : fallbackMode ? `${state.typesafe_model} → LLM fallback` : state.typesafe_model;
+    : state.typesafe_model;
   $("text-model-tag").textContent = llmMode
     ? "decisions + text"
-    : fallbackMode ? `${state.text_model} fallback + text` : `${state.text_model} text helper`;
+    : `${state.text_model} text helper`;
   $("helper").textContent = `Text helper · ${state.text_model}`;
   $("plan").innerHTML = (state.plan || [])
     .map(
@@ -136,11 +128,8 @@ function render() {
     predicted: "Choice ready · inspect or execute",
     done: "Model reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
-    screenshot_pending: "LLM requested the browser screenshot · approval required",
   };
-  $("status").textContent = state.fallback_pending
-    ? "Jev made no progress · LLM fallback ready"
-    : labels[state.status] || state.status;
+  $("status").textContent = labels[state.status] || state.status;
   if (!page) {
     controls();
     return;
@@ -163,8 +152,7 @@ function render() {
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
   $("completion").textContent = d ? d.operation : "—";
   $("ranking-note").textContent = d
-    ? d.decision_engine === "llm_fallback" ? "Jev blocked · chosen by LLM"
-      : d.decision_engine === "llm" ? "Chosen by LLM" : "Ranked by Jev"
+    ? d.decision_engine === "llm" ? "Chosen by LLM" : "Ranked by Jev"
     : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
   $("operation-choices").innerHTML = op.length
@@ -222,7 +210,6 @@ $("task-form").addEventListener("submit", (event) => {
         target_id: $("target").value,
         text_model: $("text-model").value,
         decision_mode: $("decision-mode").value,
-        screenshot_mode: $("auto-screenshot").checked ? "auto" : "approval",
         log_questions: $("log-questions").checked,
       }),
     "Attaching to the selected tab…",
@@ -237,21 +224,14 @@ $("execute").addEventListener("click", () =>
     "Executing the choice…",
   ),
 );
-$("approve-screenshot").addEventListener("click", () =>
-  perform(
-    () => call("approve_screenshot", {fingerprint: state.page.fingerprint}),
-    "Sending the approved screenshot to the LLM…",
-  ),
-);
 $("auto").addEventListener("click", () =>
   perform(async () => {
     automatic = true;
     controls();
-    while (automatic && !["done", "blocked", "screenshot_pending"].includes(state.status)) {
+    while (automatic && !["done", "blocked"].includes(state.status)) {
       $("status").textContent = "Running…";
-      if ($("pace").checked) {
+      if ($("pace").checked && state.decision_mode !== "llm") {
         await call("predict", {blocked_indices: blockedIndices()});
-        if (state.status === "screenshot_pending") break;
         await new Promise(resolve => setTimeout(resolve, 450));
         if (!automatic) break;
         await call("act", {fingerprint: state.page.fingerprint});
@@ -274,9 +254,7 @@ $("decision-mode").addEventListener("change", () => {
   const selectedMode = $("decision-mode").value;
   $("model-help").textContent = selectedMode === "llm"
     ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : selectedMode === "jev_fallback"
-      ? "Jev chooses first; LLM retries one decision when Jev returns BLOCKED"
-      : "LLM used only when Jev chooses TYPE_TEXT";
+    : "LLM used only when Jev chooses TYPE_TEXT";
 });
 $("choices").addEventListener("pointerover", (event) => {
   const id = event.target.closest("[data-action]")?.dataset.action;

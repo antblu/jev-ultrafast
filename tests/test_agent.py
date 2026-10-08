@@ -211,52 +211,31 @@ def test_llm_mode_chooses_only_an_observed_operation_and_target(monkeypatch):
     assert set(sent["choices"]["CLICK"]) == {"1", "2"}
 
 
-def test_llm_can_request_a_screenshot_without_choosing_an_action(monkeypatch):
+@pytest.mark.parametrize("compatible", [True, False])
+def test_model_image_capability_controls_request_and_redaction(monkeypatch, compatible):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
-    monkeypatch.setattr(
-        model,
-        "post_json",
-        Mock(
-            return_value={
-                "model": "provider/vision-model",
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"screenshot_required":true,"operation":null,"target":null}'
-                        }
-                    }
-                ],
-            }
-        ),
-    )
-    result = model.choose_llm(page(), "Answer the diagram question", [])
-    assert result["screenshot_required"] is True
-    assert result["choice"] is None
-
-
-def test_llm_receives_approved_screenshot_but_logs_redacted_request(monkeypatch):
-    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
-    logged = []
-    post = Mock(
-        return_value={
-            "model": "provider/vision-model",
-            "choices": [
-                {
-                    "message": {
-                        "content": '{"screenshot_required":false,"operation":"CLICK","target":"2"}'
-                    }
-                }
-            ],
-        }
-    )
+    monkeypatch.setenv("MODEL_CONFIG", json.dumps({"vision": {"image_compatible": compatible}}))
+    post = Mock(return_value={"choices": [{"message": {"content": '{"operation":"CLICK","target":"2"}'}}]})
     monkeypatch.setattr(model, "post_json", post)
-    result = model.choose_llm(
-        page(), "Answer the diagram question", [], screenshot="jpeg-base64", log_request=logged.append
-    )
-    sent_content = post.call_args.args[2]["messages"][1]["content"]
-    assert sent_content[1]["image_url"]["url"] == "data:image/jpeg;base64,jpeg-base64"
-    assert logged[0]["messages"][1]["content"][1]["image_url"]["url"] == "[screenshot omitted]"
-    assert result["request"]["messages"][1]["content"][1]["image_url"]["url"] == "[screenshot omitted]"
+    current = page()
+    current["screenshot"] = "jpeg-base64"
+    logged = []
+    result = model.choose_llm(current, "Answer the question", [], model="vision", log_request=logged.append)
+    content = post.call_args.args[2]["messages"][1]["content"]
+    if compatible:
+        assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,jpeg-base64"
+        assert logged[0]["messages"][1]["content"][1]["image_url"]["url"] == "[screenshot omitted]"
+    else:
+        assert isinstance(content, str)
+    assert "jpeg-base64" not in json.dumps(result)
+
+
+def test_per_model_provider_credentials_stay_server_side(monkeypatch):
+    monkeypatch.setenv("LITELLM_API_KEY", "private-test-key")
+    monkeypatch.setenv("MODEL_CONFIG", json.dumps({"torchcast": {
+        "image_compatible": False, "base_url": "https://proxy.test/v1", "api_key_env": "LITELLM_API_KEY",
+    }}))
+    assert model.text_model_config("torchcast")[:3] == ("private-test-key", "https://proxy.test/v1", "torchcast")
 
 
 def test_llm_mode_rejects_an_invented_target(monkeypatch):
@@ -513,111 +492,15 @@ def test_agent_predict_dispatches_to_the_selected_llm_mode(runner, monkeypatch):
     jev.assert_not_called()
 
 
-def test_screenshot_request_pauses_for_approval_then_chooses(runner, monkeypatch):
-    runner.state.update(
-        status="ready",
-        decision=None,
-        decision_mode="llm",
-        text_model="provider/vision-model",
-        screenshot_mode="approval",
-        screenshot_pending=None,
-    )
-    runner.state["page"]["screenshot"] = "jpeg-base64"
-    screenshot_request = {
-        **decision(None),
-        "choice": None,
-        "operation": None,
-        "target": None,
-        "screenshot_required": True,
-    }
-    visual_decision = {**decision("e3"), "operation": "CLICK", "target": "2", "screenshot_required": False}
-    llm = Mock(side_effect=[screenshot_request, visual_decision])
+def test_jev_blocked_stops_without_llm_fallback(runner, monkeypatch):
+    runner.state.update(status="ready", decision=None, decision_mode="jev")
+    blocked = {**decision("BLOCKED"), "operation": "BLOCKED", "target": None}
+    monkeypatch.setattr(loop, "choose", Mock(return_value=blocked))
+    llm = Mock()
     monkeypatch.setattr(loop, "choose_llm", llm)
-    runner.command("predict")
-    assert runner.state["status"] == "screenshot_pending"
-    assert runner.state["decision"] is None
-    runner.state["browser"].act.assert_not_called()
-    runner.command("approve_screenshot", {"fingerprint": runner.state["page"]["fingerprint"]})
-    assert llm.call_args.kwargs["screenshot"] == "jpeg-base64"
-    assert runner.state["status"] == "predicted"
-    assert runner.state["decision"]["choice"] == "e3"
-
-
-def test_automatic_screenshot_mode_requeries_without_executing(runner, monkeypatch):
-    runner.state.update(
-        status="ready",
-        decision=None,
-        decision_mode="llm",
-        text_model="provider/vision-model",
-        screenshot_mode="auto",
-        screenshot_pending=None,
-    )
-    runner.state["page"]["screenshot"] = "jpeg-base64"
-    screenshot_request = {
-        **decision(None),
-        "choice": None,
-        "operation": None,
-        "target": None,
-        "screenshot_required": True,
-    }
-    visual_decision = {**decision("e3"), "operation": "CLICK", "target": "2", "screenshot_required": False}
-    llm = Mock(side_effect=[screenshot_request, visual_decision])
-    monkeypatch.setattr(loop, "choose_llm", llm)
-    runner.command("predict")
-    assert llm.call_count == 2
-    assert llm.call_args.kwargs["screenshot"] == "jpeg-base64"
-    assert runner.state["decision"]["choice"] == "e3"
-    runner.state["browser"].act.assert_not_called()
-
-
-def test_jev_fallback_uses_llm_once_then_keeps_jev_mode(runner, monkeypatch):
-    runner.state.update(status="ready", decision=None, decision_mode="jev_fallback", text_model="provider/selected")
-    jev_decision = decision("BLOCKED")
-    jev_decision.update(operation="BLOCKED", target=None, model="jev-test")
-    llm_decision = decision("e3")
-    llm_decision.update(operation="CLICK", target="2")
-    next_jev_decision = decision("e3")
-    next_jev_decision.update(operation="CLICK", target="2", model="jev-test")
-    jev = Mock(side_effect=[jev_decision, next_jev_decision])
-    llm = Mock(return_value=llm_decision)
-    monkeypatch.setattr(loop, "choose", jev)
-    monkeypatch.setattr(loop, "choose_llm", llm)
-    runner.command("predict")
-    assert jev.call_count == 1 and llm.call_count == 1
-    assert runner.state["decision"]["choice"] == "e3"
-    assert runner.state["decision"]["decision_engine"] == "llm_fallback"
-    assert runner.state["decision_mode"] == "jev_fallback"
-    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
-    runner.command("predict")
-    assert jev.call_count == 2 and llm.call_count == 1
-    assert runner.state["decision"]["decision_engine"] == "jev"
-
-
-def test_jev_no_progress_guard_schedules_one_llm_fallback(runner, monkeypatch):
-    runner.state.update(
-        decision={**decision("e3"), "operation": "CLICK", "target": "2", "decision_engine": "jev"},
-        decision_mode="jev_fallback",
-        text_model="provider/selected",
-        history=[
-            {"page_changed": False, "kind": "click"},
-            {"page_changed": False, "kind": "click"},
-        ],
-    )
-    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
-    assert runner.state["status"] == "ready"
-    assert runner.state["fallback_pending"]["reason"] == "NO_PROGRESS"
-
-    llm_decision = {**decision("e3"), "operation": "CLICK", "target": "2"}
-    llm = Mock(return_value=llm_decision)
-    jev = Mock()
-    monkeypatch.setattr(loop, "choose_llm", llm)
-    monkeypatch.setattr(loop, "choose", jev)
-    runner.command("predict")
-    llm.assert_called_once()
-    jev.assert_not_called()
-    assert runner.state["decision"]["decision_engine"] == "llm_fallback"
-    assert runner.state["decision"]["fallback_from"]["reason"] == "NO_PROGRESS"
-    assert runner.state["fallback_pending"] is None
+    runner.command("tick")
+    assert runner.state["status"] == "blocked"
+    llm.assert_not_called()
 
 
 @pytest.mark.parametrize("response", [{"exceptionDetails": {}}, {"result": {}}])
@@ -687,3 +570,32 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+@pytest.mark.parametrize("config", ['[]', '{"model":{"image_compatible":"false"}}',
+                                  '{"model":{"api_key":"secret"}}'])
+def test_invalid_model_configuration_fails_closed(monkeypatch, config):
+    monkeypatch.setenv("MODEL_CONFIG", config)
+    with pytest.raises(ValueError, match="MODEL_CONFIG"):
+        model.model_catalog()
+
+
+def test_image_model_missing_image_does_not_call_provider(monkeypatch):
+    monkeypatch.setenv("MODEL_CONFIG", '{"vision":{"image_compatible":true}}')
+    post = Mock()
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="current browser image"):
+        model.choose_llm(page(), "Read the diagram", [], model="vision")
+    post.assert_not_called()
+
+
+def test_public_model_picker_excludes_provider_settings(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.setattr(demo, "AGENT", None)
+    monkeypatch.setattr(demo, "available_tabs", lambda: [])
+    monkeypatch.setenv("MODEL_CONFIG", '{"vision":{"image_compatible":true,"api_key_env":"PRIVATE_KEY"}}')
+    state = demo.response_state()
+    assert state["model_capabilities"]["vision"] == {"image_compatible": True}
+    assert "vision" in state["text_models"]
+    assert "PRIVATE_KEY" not in json.dumps(state)
