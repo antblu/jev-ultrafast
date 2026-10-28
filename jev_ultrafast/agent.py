@@ -11,6 +11,7 @@ from pathlib import Path
 from .browser import Browser, StalePage
 from .model import action_space, choose, choose_llm, field_context, field_text, filter_blocked_actions, model_settings
 from .questions import MAX_STEPS
+from .quiz_memory import QuizMemory, marked_incorrect, question_on_page
 
 
 class Agent:
@@ -34,6 +35,8 @@ class Agent:
         capture_images = decision_mode == "llm" and model_settings(text_model)["image_compatible"]
         plan = [task]
         self.pending_text = None
+        self.quiz_memory = QuizMemory()
+        self.pending_quiz_question = None
         self.browser = Browser(
             url,
             target_id=target_id,
@@ -59,6 +62,7 @@ class Agent:
             decision=None,
             history=[],
             status="ready",
+            stop_reason=None,
             plan=plan,
             plan_index=0,
             decisions=[],
@@ -128,6 +132,7 @@ class Agent:
             state["page"], state["goal"], state["history"],
             model=state.get("text_model"), blocked_indices=state["blocked_indices"],
             log_request=lambda request: self._log_request(request, "llm"),
+            known_answers=getattr(self, "quiz_memory", QuizMemory()).matches(state["page"]),
         )
         decision["decision_engine"] = "llm"
         return decision
@@ -176,6 +181,7 @@ class Agent:
                     state["history"],
                     blocked_indices=state["blocked_indices"],
                     log_request=lambda request: self._log_request(request, "jev"),
+                    known_answers=getattr(self, "quiz_memory", QuizMemory()).matches(state["page"]),
                 )
                 state["decision"] = jev_decision
                 state["decision"]["decision_engine"] = "jev"
@@ -187,6 +193,7 @@ class Agent:
                 }
             )
             state["status"] = "predicted"
+            state["stop_reason"] = None
         elif name == "act":
             decision, page = state["decision"], state["page"]
             if not decision or body.get("fingerprint") != page["fingerprint"]:
@@ -200,13 +207,15 @@ class Agent:
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
                 state["status"] = "done" if selected == "DONE" else "blocked"
+                state["stop_reason"] = "model_blocked" if selected == "BLOCKED" else None
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
-                raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
+                state["stop_reason"] = "step_budget"
+                raise ValueError(f"Stopped at the {MAX_STEPS}-action budget")
             text, helper = None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
@@ -228,6 +237,7 @@ class Agent:
                     "step": len(state["history"]) + 1,
                     "action": action["label"],
                     "kind": action["kind"],
+                    "group": action.get("group"),
                     "choice": selected,
                     "probability": decision["probabilities"].get(selected),
                     "confidence": decision["confidence"],
@@ -246,6 +256,16 @@ class Agent:
             )
             self._log_execution(page, action, decision, text)
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            question = question_on_page(page)
+            if question and action["kind"] == "click" and action.get("role") == "radio":
+                self.pending_quiz_question = (question, action["label"])
+            pending = getattr(self, "pending_quiz_question", None)
+            if pending:
+                if marked_incorrect(page, state["page"]):
+                    self.quiz_memory.save(pending[0], pending[1])
+                    self.pending_quiz_question = None
+                elif question_on_page(state["page"]) not in {None, pending[0]}:
+                    self.pending_quiz_question = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
@@ -260,7 +280,14 @@ class Agent:
             no_progress = len(repeated) == 3 and all(
                 h["page_changed"] is False and h["kind"] != "wait" for h in repeated
             )
-            state["status"] = "blocked" if no_progress else "ready"
+            # One setup click in a new observed group can prepare a paired control without changing text.
+            groups = [h.get("group") for h in repeated]
+            pair_setup = (no_progress and all(h["kind"] == "click" for h in repeated)
+                          and groups[0] and groups[0] == groups[1] and groups[2]
+                          and groups[2] != groups[1])
+            stopped = no_progress and not pair_setup
+            state["status"] = "blocked" if stopped else "ready"
+            state["stop_reason"] = "no_progress" if stopped else None
         else:
             raise ValueError("Unknown command")
         return self.snapshot()

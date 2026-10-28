@@ -5,10 +5,12 @@ import json
 import os
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
@@ -21,6 +23,7 @@ ORIGIN = f"http://127.0.0.1:{PORT}"
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 AGENT = None
+MODEL_LIST_CACHE = {"key": None, "expires": 0, "ids": ()}
 
 
 def load_environment():
@@ -32,14 +35,52 @@ def load_environment():
                 os.environ.setdefault(key, value)
 
 
+def endpoint_models():
+    """Fetch model IDs with the server-side text key; cache to avoid polling on every step."""
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    key = os.environ.get("TEXT_MODEL_API_KEY", "")
+    identity = (base, key)
+    if not key:
+        return ()
+    if MODEL_LIST_CACHE["key"] == identity and time.monotonic() < MODEL_LIST_CACHE["expires"]:
+        return MODEL_LIST_CACHE["ids"]
+    try:
+        response = httpx.get(base + "/models", headers={"Authorization": f"Bearer {key}"}, timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        ids = tuple(dict.fromkeys(item["id"] for item in data["data"]
+                                  if isinstance(item, dict) and isinstance(item.get("id"), str)
+                                  and item["id"].strip()))
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        ids = ()
+    MODEL_LIST_CACHE.update(key=identity, ids=ids, expires=time.monotonic() + (300 if ids else 30))
+    return ids
+
+
+def decision_models():
+    catalog = model_catalog()
+    defaults = {"model_type": "llm", "image_compatible": False, "audio_compatible": False}
+    names = dict.fromkeys((*endpoint_models(), *catalog))
+    return [
+        {"id": "jev", "name": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+         "model_type": "decision", "image_compatible": False, "audio_compatible": False},
+        *[
+            {"id": name, "name": name,
+             **{key: settings[key] for key in ("model_type", "image_compatible", "audio_compatible")}}
+            for name in names
+            for settings in [{**defaults, **catalog.get(name, {})}]
+            if name != "jev"
+        ],
+    ]
+
+
 def response_state():
     state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
     return {
         **state,
+        "selected_model": state.get("selected_model", "jev"),
+        "models": decision_models(),
         "text_model": state.get("text_model", default_text_model()),
-        "text_models": text_model_options(),
-        "model_capabilities": {name: {"image_compatible": settings["image_compatible"]}
-                               for name, settings in model_catalog().items()},
         "typesafe_model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "tabs": available_tabs(),
     }
@@ -87,12 +128,11 @@ def command(name, body):
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
 
-        text_model = body.get("text_model", "")
-        if text_model not in text_model_options():
-            raise ValueError("Select a configured text model")
-        decision_mode = body.get("decision_mode", "")
-        if decision_mode not in {"jev", "llm"}:
-            raise ValueError("Select a decision engine")
+        selected_model = body.get("model", "")
+        if not isinstance(selected_model, str) or selected_model not in {item["id"] for item in decision_models()}:
+            raise ValueError("Select a configured model")
+        decision_mode = "jev" if selected_model == "jev" else "llm"
+        text_model = default_text_model() if selected_model == "jev" else selected_model
         close_browser()
         target = find_tab(body.get("target_id"))
 
@@ -115,6 +155,7 @@ def command(name, body):
             ),
         )
 
+        AGENT.state["selected_model"] = selected_model
         AGENT.state["scenario"] = "attached-tab"
         AGENT.state["target_id"] = target["id"]
         AGENT.state["attached_url"] = target["url"]

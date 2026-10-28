@@ -150,6 +150,102 @@ def main():
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
 
+        browser.evaluate("document.body.innerHTML=" + repr("""
+          <div><div>Sources</div><div><button id="source"
+            onclick="window.pairSource='first';this.setAttribute('aria-pressed','true')">First item</button></div></div>
+          <div><div>Destinations</div><div><button id="destination"
+            onclick="if(window.pairSource==='first')
+              document.querySelector('#pair-result').textContent='Pair connected'">
+            Matching destination</button></div></div><p id="pair-result">No pair</p>
+        """))
+        page = browser.observe(screenshot=False)
+        source = next(a for a in page["actions"] if a["label"] == "First item")
+        assert source["group"] == "Sources"
+        browser.act(source, page)
+        selected_page = browser.observe(screenshot=False)
+        source = next(a for a in selected_page["actions"] if a["label"] == "First item")
+        assert source["pressed"] == "true"
+        assert selected_page["fingerprint"] != page["fingerprint"]
+        destination = next(a for a in selected_page["actions"] if a["label"] == "Matching destination")
+        assert destination["group"] == "Destinations"
+        browser.act(destination, selected_page)
+        result_page = browser.observe(screenshot=False)
+        assert "Pair connected" in result_page["text"]
+        assert browser.evaluate("document.querySelector('#pair-result').textContent") == "Pair connected"
+        passed.append("generic group headings and pressed state support a verified two-click pair")
+
+        browser.evaluate("document.querySelector('#source').removeAttribute('aria-pressed'); "
+                         "document.querySelector('#source').onclick=()=>{ "
+                         "document.querySelector('#source').style.outline='3px dashed black' }")
+        page = browser.observe(screenshot=False)
+        source = next(a for a in page["actions"] if a["label"] == "First item")
+        browser.act(source, page)
+        selected_page = browser.observe(screenshot=False)
+        source = next(a for a in selected_page["actions"] if a["label"] == "First item")
+        assert source["visual_state"]["outline"] == "dashed"
+        assert selected_page["fingerprint"] != page["fingerprint"]
+        assert not browser.fresh(page, next(a for a in page["actions"] if a["label"] == "First item"))
+        browser.evaluate("document.querySelector('#source').style.outline='3px solid black'")
+        page = browser.observe(screenshot=False)
+        browser.evaluate("document.querySelector('#source').style.outline='4px solid red'")
+        assert browser.fresh(page), "Solid focus outlines should not count as selection progress"
+        passed.append("CSS-only dashed selection changes progress and guards; focus color/width does not")
+
+        browser.call("Page.navigate", url="data:text/html," + quote(
+            '<button>Page start</button><div style="height:1600px"></div><button>Page end</button>'
+        ))
+        page = browser.observe(screenshot=False)
+        down = next(a for a in page["actions"] if a["id"] == "scroll_down")
+        browser.act(down, page)
+        assert browser.evaluate("scrollY") > 0
+        passed.append("outer page scroll uses the observed document rather than fixed mouse coordinates")
+
+        scroll_html = """<style>body{margin:20px}#options{height:180px;width:300px;overflow-y:auto}
+          button{display:block;height:50px;width:200px;margin:10px}</style>
+          <h2>Options</h2><div id="options" aria-label="Additional choices">
+          <button>First visible choice</button><div style="height:400px"></div>
+          <button onclick="window.lastChoice=true">Last hidden choice</button></div>"""
+        browser.call("Page.navigate", url="data:text/html," + quote(scroll_html))
+        page = browser.observe(screenshot=False)
+        assert not any(a["label"] == "Last hidden choice" for a in page["actions"])
+        assert "Last hidden choice" not in page["text"]
+        down = next(a for a in page["actions"] if a["id"] == "scroll_down")
+        assert "Additional choices" in down["label"]
+        browser.act(down, page)
+        moved = browser.observe(screenshot=False)
+        assert browser.evaluate("document.querySelector('#options').scrollTop") > 0
+        assert moved["fingerprint"] != page["fingerprint"]
+        assert not browser.fresh(page)
+        passed.append("nested option panel offers observed scrolling and invalidates old decisions")
+        for _ in range(6):
+            down = next((a for a in moved["actions"] if a["id"] == "scroll_down"), None)
+            if down is None:
+                break
+            browser.act(down, moved)
+            moved = browser.observe(screenshot=False)
+        last = next(a for a in moved["actions"] if a["label"] == "Last hidden choice")
+        assert "Last hidden choice" in moved["text"]
+        assert not any(a["id"] == "scroll_down" for a in moved["actions"])
+        browser.act(last, moved)
+        assert browser.evaluate("window.lastChoice") is True
+        passed.append("scroll reveals an executable additional option and stops offering down at the end")
+        moved = browser.observe(screenshot=False)
+        up = next(a for a in moved["actions"] if a["id"] == "scroll_up")
+        browser.act(up, moved)
+        assert browser.evaluate("document.querySelector('#options').scrollTop") < 410
+        passed.append("nested panel can scroll back to earlier options")
+
+        frame_scroll = '<iframe style="width:500px;height:250px" srcdoc="' + escape(
+            '<style>body{margin:10px}</style><button>Frame first</button>'
+            '<div style="height:700px"></div><button>Frame last</button>', quote=True) + '"></iframe>'
+        browser.call("Page.navigate", url="data:text/html," + quote(frame_scroll))
+        page = browser.observe(screenshot=False)
+        down = next(a for a in page["actions"] if a["id"] == "scroll_down")
+        assert down["frame_id"] != "f0"
+        browser.act(down, page)
+        assert browser.evaluate("document.querySelector('iframe').contentWindow.scrollY") > 0
+        passed.append("same-origin frame document offers and executes its own scroll")
+
         browser.call("Page.navigate", url="data:text/html," + quote(FRAME_PAGE))
         for _ in range(100):
             if browser.evaluate("document.querySelector('iframe')?.contentDocument?.readyState") == "complete":

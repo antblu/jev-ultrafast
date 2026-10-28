@@ -207,7 +207,24 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            if type(action.get("node")) is not int or type(action.get("delta")) is not int:
+                raise ValueError("Invalid observed scroll region")
+            scrolled = evaluate("""(action => {
+              const cache=window.__jevFast, frameId=action.frame_id || 'f0';
+              const e=cache?.resolve(frameId,action.node),doc=cache?.documentFor(frameId);
+              if (!e?.isConnected || !doc || e.scrollHeight<=e.clientHeight+2) return false;
+              const rect=e===doc.scrollingElement ?
+                {x:0,y:0,w:doc.defaultView.innerWidth,h:doc.defaultView.innerHeight} :
+                cache.clippedRect(frameId,e);
+              if (!rect || !e.contains(cache.elementFromPoint(frameId,rect.x+rect.w/2,rect.y+rect.h/2)))
+                return false;
+              if (action.delta>0 ? e.scrollTop+e.clientHeight>=e.scrollHeight-2 : e.scrollTop<=2)
+                return false;
+              e.scrollBy({top:action.delta,behavior:'instant'});
+              return true;
+            })(""" + json.dumps(action) + ")")
+            if not scrolled:
+                raise StalePage("Scroll region changed or is covered. Observe again.")
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")

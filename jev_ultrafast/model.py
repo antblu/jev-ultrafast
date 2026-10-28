@@ -9,6 +9,7 @@ from copy import deepcopy
 import httpx
 
 from .questions import LLM_DECISION, NEXT_ACTION, TARGET, TEXT_VALUE
+from .quiz_memory import normalize
 
 CLIENT = httpx.Client(http2=True, timeout=60)
 
@@ -78,7 +79,12 @@ def action_space(actions, blocked_indices=()):
         if observed_target not in indices:
             index = str(len(elements) + 1)
             indices[observed_target] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = {
+                k: action[k] for k in (
+                    "role", "value", "checked", "selected", "expanded", "pressed", "group", "visual_state"
+                )
+                if k in action
+            }
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -127,10 +133,25 @@ def filter_blocked_actions(actions, blocked_indices):
     return filtered
 
 
+def exclude_known_mistakes(targets, known_answers):
+    """Remove only matching observed radio choices for the visible question."""
+    wrong = {normalize(answer) for entry in known_answers for answer in entry["incorrect_answers"]}
+    if not wrong or "CLICK" not in targets:
+        return targets
+    targets["CLICK"] = {
+        index: action for index, action in targets["CLICK"].items()
+        if action.get("role") != "radio" or normalize(action["label"]) not in wrong
+    }
+    if not targets["CLICK"]:
+        del targets["CLICK"]
+    return targets
+
+
 def model_catalog():
     """Resolve server-side model settings; credentials are environment references only."""
     names = ",".join([os.environ.get("TEXT_MODEL", "deepseek-chat"), os.environ.get("TEXT_MODEL_OPTIONS", "")])
-    catalog = {name.strip(): {"image_compatible": False} for name in names.split(",") if name.strip()}
+    defaults = {"image_compatible": False, "audio_compatible": False, "model_type": "llm"}
+    catalog = {name.strip(): dict(defaults) for name in names.split(",") if name.strip()}
     try:
         configured = json.loads(os.environ.get("MODEL_CONFIG", "{}"))
         if not isinstance(configured, dict):
@@ -138,14 +159,27 @@ def model_catalog():
         for name, settings in configured.items():
             if not isinstance(name, str) or not name or not isinstance(settings, dict):
                 raise ValueError()
-            if set(settings) - {"image_compatible", "base_url", "api_key_env"}:
+            if set(settings) - {
+                "image_compatible", "audio_compatible", "model_type", "base_url", "api_key_env",
+                "backend", "reasoning_effort", "decision_max_tokens", "text_max_tokens",
+            }:
                 raise ValueError()
-            if not isinstance(settings.get("image_compatible", False), bool):
+            if any(not isinstance(settings.get(key, False), bool)
+                   for key in ("image_compatible", "audio_compatible")):
                 raise ValueError()
+            if settings.get("model_type", "llm") not in {"decision", "llm"}:
+                raise ValueError()
+            if settings.get("backend", "openai") not in {"openai", "llama_cpp"}:
+                raise ValueError()
+            if settings.get("reasoning_effort", "none") not in {"none", "low", "medium", "high"}:
+                raise ValueError()
+            for key in ("decision_max_tokens", "text_max_tokens"):
+                if key in settings and (type(settings[key]) is not int or not 64 <= settings[key] <= 8192):
+                    raise ValueError()
             for key in ("base_url", "api_key_env"):
                 if key in settings and (not isinstance(settings[key], str) or not settings[key]):
                     raise ValueError()
-            catalog[name] = {"image_compatible": False, **settings}
+            catalog[name] = {**defaults, **settings}
     except (ValueError, TypeError):
         raise ValueError("MODEL_CONFIG must map model names to valid provider and image settings") from None
     return catalog
@@ -169,6 +203,9 @@ def text_model_config(model=None):
     }
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    if settings.get("backend") == "llama_cpp":
+        effort = settings.get("reasoning_effort", "none" if os.environ.get("TEXT_MODEL_REASONING") == "none" else "low")
+        reasoning = {"reasoning_effort": effort, "chat_template_kwargs": {"enable_thinking": effort != "none"}}
     return key, base, model, reasoning
 
 
@@ -178,6 +215,13 @@ def token_budget(name, default):
     except ValueError:
         value = default
     return min(8192, max(64, value))
+
+
+def completion_budget(model, kind):
+    settings = model_settings(model)
+    if f"{kind}_max_tokens" in settings:
+        return settings[f"{kind}_max_tokens"]
+    return token_budget("LLM_DECISION_MAX_TOKENS" if kind == "decision" else "TEXT_VALUE_MAX_TOKENS", 1024)
 
 
 def decision_format(model):
@@ -203,8 +247,9 @@ def redact_image_data(body):
     return redacted
 
 
-def choose(state, goal, history, *, blocked_indices=(), log_request=None):
+def choose(state, goal, history, *, blocked_indices=(), log_request=None, known_answers=()):
     elements, targets, controls = action_space(state["actions"], blocked_indices)
+    targets = exclude_known_mistakes(targets, known_answers)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -235,8 +280,10 @@ def choose(state, goal, history, *, blocked_indices=(), log_request=None):
             "page": {k: state[k] for k in ("url", "title", "text")},
             "elements": elements,
             "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
+                {k: h.get(k) for k in ("action", "kind", "target", "text", "page_changed", "group")}
+                for h in history[-10:]
             ],
+            "known_quiz_mistakes": list(known_answers),
         },
         "questions": questions,
     }
@@ -275,19 +322,60 @@ def choose(state, goal, history, *, blocked_indices=(), log_request=None):
     }
 
 
-def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None):
+def observed_decision_schema(targets, controls):
+    variants = []
+    for operation in [*targets, *controls, "DONE", "BLOCKED"]:
+        target_schema = ({"type": "string", "enum": list(targets[operation])}
+                         if operation in targets else {"type": "null"})
+        variants.append({
+            "type": "object",
+            "properties": {"operation": {"type": "string", "enum": [operation]}, "target": target_schema},
+            "required": ["operation", "target"],
+            "additionalProperties": False,
+        })
+    return {"oneOf": variants}
+
+
+def unchanged_clicks(state, history, limit=3):
+    """Recover recent observed group context only while every click left this page unchanged."""
+    unchanged = []
+    for item in reversed(history):
+        if item.get("page_changed") is not False or item.get("kind") != "click":
+            break
+        action = next((action for action in state["actions"] if action["id"] == item.get("choice")), {})
+        unchanged.append({"target": item.get("target"), "group": item.get("group") or action.get("group")})
+        if len(unchanged) == limit:
+            break
+    return list(reversed(unchanged))
+
+
+def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_request=None,
+               known_answers=()):
     image_compatible = model_settings(model)["image_compatible"]
     screenshot = state.get("screenshot") if image_compatible else None
     if image_compatible and not screenshot:
         raise ValueError("Image-compatible model requires a current browser image; no action executed")
     _, targets, controls = action_space(state["actions"], blocked_indices)
+    targets = exclude_known_mistakes(targets, known_answers)
+    unchanged = unchanged_clicks(state, history)
+    stalled_group = None
+    if len(unchanged) >= 2 and unchanged[-1]["group"] and unchanged[-1]["group"] == unchanged[-2]["group"]:
+        stalled_group = unchanged[-1]["group"]
+        # Only restrict a stalled group when another observed group offers a different interaction.
+        if any(action.get("group") and action["group"] != stalled_group
+               for action in targets.get("CLICK", {}).values()):
+            targets["CLICK"] = {index: action for index, action in targets["CLICK"].items()
+                                if action.get("group") != stalled_group}
+        else:
+            stalled_group = None
     choices = {
         operation: {
             index: {
                 "label": action["label"],
                 **{
                     key: action[key]
-                    for key in ("role", "value", "current_value", "checked", "selected", "expanded")
+                    for key in ("role", "value", "current_value", "checked", "selected", "expanded",
+                                "pressed", "group", "visual_state")
                     if key in action
                 },
             }
@@ -300,40 +388,45 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         DONE={"label": "Every requirement is visibly satisfied."},
         BLOCKED={"label": "No supported operation can progress."},
     )
-    answer_candidates = {
-        index: candidate
-        for index, candidate in choices.get("CLICK", {}).items()
-        if candidate.get("role") in {"radio", "checkbox"}
-    }
     context = {
         "goal": goal,
+        "known_quiz_mistakes": list(known_answers),
         "page": {key: state[key] for key in ("url", "title", "text")},
         "choices": choices,
-        "current_radio_checkbox_candidates": answer_candidates,
         "recent_actions": [
-            {key: item.get(key) for key in ("action", "kind", "text", "page_changed")}
+            {key: item.get(key) for key in ("action", "kind", "target", "text", "page_changed", "group")}
             for item in history[-10:]
         ],
-        "rules": [NEXT_ACTION, TARGET],
         "screenshot_supplied": bool(screenshot),
+        "last_executed_click": ({key: history[-1].get(key) for key in ("action", "target", "group", "page_changed")}
+                                if history and history[-1].get("kind") == "click" else None),
     }
+    if unchanged:
+        context["execution_feedback"] = {
+            "unchanged_clicks": unchanged,
+            "temporarily_omitted_click_group": stalled_group,
+            "instruction": "Repeated clicks in one group made no observed change. Try a different relevant group. "
+                           "For paired controls, select one source then its destination; a source selection "
+                           "can require the next destination click to produce an observed change. "
+                           "Existing drawn connections are completed pairs, not an active source selection.",
+        }
     key, base, model, reasoning = text_model_config(model)
     output_format = decision_format(model)
     body = {
         "model": model,
-        "max_tokens": token_budget("LLM_DECISION_MAX_TOKENS", 1024),
+        "max_tokens": completion_budget(model, "decision"),
         **reasoning,
         "messages": [
-            {"role": "system", "content": LLM_DECISION},
+            {"role": "system", "content": "\n".join([LLM_DECISION, NEXT_ACTION, TARGET])},
             {
                 "role": "user",
                 "content": (
                     [
-                        {"type": "text", "text": json.dumps(context)},
+                        {"type": "text", "text": json.dumps(context, separators=(",", ":"))},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot}"}},
                     ]
                     if screenshot
-                    else json.dumps(context)
+                    else json.dumps(context, separators=(",", ":"))
                 ),
             },
         ],
@@ -373,6 +466,8 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         )
     else:
         body["response_format"] = {"type": "json_object"}
+        if model_settings(model).get("backend") == "llama_cpp":
+            body["response_format"]["schema"] = observed_decision_schema(targets, controls)
     logged_body = redact_image_data(body)
     if log_request:
         log_request(logged_body)
@@ -384,7 +479,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         if response_choice.get("finish_reason") == "length":
             raise RuntimeError(
                 "LLM decision was truncated before it emitted JSON. Increase "
-                "LLM_DECISION_MAX_TOKENS or disable model reasoning; no action executed."
+                "the model decision_max_tokens (or LLM_DECISION_MAX_TOKENS) or disable reasoning; no action executed."
             )
         if output_format == "tool":
             tool_calls = message.get("tool_calls") or []
@@ -403,6 +498,9 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         if not isinstance(output, dict) or set(output) != {"operation", "target"}:
             raise ValueError()
         operation, target = output["operation"], output["target"]
+        if not isinstance(operation, str):
+            raise ValueError()
+        operation = operation.strip().upper()
         if operation in targets:
             if isinstance(target, int) and not isinstance(target, bool):
                 target = str(target)
@@ -431,6 +529,7 @@ def choose_llm(state, goal, history, *, model=None, blocked_indices=(), log_requ
         "raw_answers": output,
         "model": result.get("model", model),
         "usage": result.get("usage", {}),
+        "timings": result.get("timings", {}),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": logged_body,
     }
@@ -453,14 +552,14 @@ def field_text(context, *, model=None):
         key,
         {
             "model": model,
-            "max_tokens": token_budget("TEXT_VALUE_MAX_TOKENS", 1024),
+            "max_tokens": completion_budget(model, "text"),
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [
                 {"role": "system", "content": TEXT_VALUE},
                 {
                     "role": "user",
-                    "content": json.dumps(context),
+                    "content": json.dumps(context, separators=(",", ":")),
                 },
             ],
         },

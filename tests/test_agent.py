@@ -596,6 +596,229 @@ def test_public_model_picker_excludes_provider_settings(monkeypatch):
     monkeypatch.setattr(demo, "available_tabs", lambda: [])
     monkeypatch.setenv("MODEL_CONFIG", '{"vision":{"image_compatible":true,"api_key_env":"PRIVATE_KEY"}}')
     state = demo.response_state()
-    assert state["model_capabilities"]["vision"] == {"image_compatible": True}
-    assert "vision" in state["text_models"]
+    entries = {item["id"]: item for item in state["models"]}
+    assert entries["vision"] == {"id": "vision", "name": "vision", "image_compatible": True,
+                                 "audio_compatible": False, "model_type": "llm"}
+    assert entries["jev"]["model_type"] == "decision"
     assert "PRIVATE_KEY" not in json.dumps(state)
+
+
+def test_model_picker_discovers_endpoint_ids_and_keeps_key_server_side(monkeypatch):
+    from jev_ultrafast import demo
+
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://models.test/v1")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "secret-test-key")
+    monkeypatch.setenv("TEXT_MODEL", "configured")
+    monkeypatch.setenv("MODEL_CONFIG", '{"vision":{"image_compatible":true}}')
+    monkeypatch.setattr(demo, "MODEL_LIST_CACHE", {"key": None, "expires": 0, "ids": ()})
+    monkeypatch.setattr(demo, "available_tabs", lambda: [])
+    response = Mock()
+    response.json.return_value = {"data": [{"id": "new-model"}, {"id": "configured"}]}
+    request = Mock(return_value=response)
+    monkeypatch.setattr(demo.httpx, "get", request)
+    state = demo.response_state()
+    entries = {item["id"]: item for item in state["models"]}
+    assert {"jev", "new-model", "configured", "vision"} <= set(entries)
+    assert entries["new-model"]["model_type"] == "llm"
+    assert entries["vision"]["image_compatible"] is True
+    assert request.call_count == 1
+    demo.response_state()
+    assert request.call_count == 1
+    assert request.call_args.kwargs["headers"] == {"Authorization": "Bearer secret-test-key"}
+    assert "secret-test-key" not in json.dumps(state)
+
+
+@pytest.mark.parametrize("selected,mode", [("jev", "jev"), ("torchcast", "llm"), ("standard", "llm")])
+def test_single_model_picker_selects_provider_on_server(monkeypatch, selected, mode):
+    from jev_ultrafast import demo
+
+    monkeypatch.setenv("TEXT_MODEL", "standard")
+    monkeypatch.setenv("MODEL_CONFIG", json.dumps({"torchcast": {
+        "model_type": "decision", "image_compatible": True, "audio_compatible": True,
+    }}))
+    monkeypatch.setattr(demo, "AGENT", None)
+    monkeypatch.setattr(demo, "available_tabs", lambda: [{"id": "tab", "url": "https://example.test"}])
+    instance = Mock(state={})
+    instance.snapshot.side_effect = lambda: instance.state
+    agent = Mock(return_value=instance)
+    monkeypatch.setattr(demo, "Agent", agent)
+    result = demo.command("reset", {"goal": "Find a book", "target_id": "tab", "model": selected})
+    assert agent.call_args.kwargs["decision_mode"] == mode
+    assert agent.call_args.kwargs["text_model"] == ("standard" if selected == "jev" else selected)
+    assert result["selected_model"] == selected
+    torchcast = next(item for item in result["models"] if item["id"] == "torchcast")
+    assert torchcast["model_type"] == "decision"
+    assert torchcast["image_compatible"] is True
+    assert torchcast["audio_compatible"] is True
+
+
+
+def test_torchcast_uses_dedicated_key_despite_inherited_litellm_key(monkeypatch, tmp_path):
+    from jev_ultrafast import demo
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LITELLM_API_KEY", "unrelated-inherited-key")
+    monkeypatch.delenv("JEV_TORCHCAST_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL_CONFIG", raising=False)
+    config = {"torchcast": {"api_key_env": "JEV_TORCHCAST_API_KEY"}}
+    (tmp_path / ".env").write_text(
+        "JEV_TORCHCAST_API_KEY=torchcast-test-key\nMODEL_CONFIG=" + json.dumps(config) + "\n"
+    )
+    demo.load_environment()
+    assert model.text_model_config("torchcast")[0] == "torchcast-test-key"
+
+
+@pytest.mark.parametrize("kind,budget", [("decision", 256), ("text", 512)])
+def test_llama_cpp_uses_explicit_reasoning_controls_and_model_budget(monkeypatch, kind, budget):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("LLM_DECISION_MAX_TOKENS", "8192")
+    monkeypatch.setenv("TEXT_VALUE_MAX_TOKENS", "8192")
+    monkeypatch.setenv("MODEL_CONFIG", json.dumps({"torchcast": {
+        "backend": "llama_cpp", "reasoning_effort": "none", "decision_max_tokens": 256, "text_max_tokens": 512,
+    }}))
+    content = '{"operation":"CLICK","target":"2"}' if kind == "decision" else '{"text":"book"}'
+    post = Mock(return_value={"choices": [{"message": {"content": content}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    if kind == "decision":
+        model.choose_llm(page(), "Find a book", [], model="torchcast")
+    else:
+        model.field_text({"goal": "Find a book"}, model="torchcast")
+    body = post.call_args.args[2]
+    assert body["reasoning_effort"] == "none"
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning" not in body
+    assert body["max_tokens"] == budget
+
+
+@pytest.mark.parametrize("budget", [True, 0, 9000, "256"])
+def test_invalid_per_model_budget_is_rejected(monkeypatch, budget):
+    monkeypatch.setenv("MODEL_CONFIG", json.dumps({"torchcast": {"decision_max_tokens": budget}}))
+    with pytest.raises(ValueError, match="MODEL_CONFIG"):
+        model.model_catalog()
+
+
+
+@pytest.mark.parametrize("operation", ["CLICK", "click", "Click", " cLiCk "])
+def test_llm_operation_case_normalization_preserves_observed_target(monkeypatch, operation):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(return_value={"choices": [{"message": {
+        "content": json.dumps({"operation": operation, "target": 2}),
+    }}]})
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(page(), "Submit the search", [])
+    assert result["operation"] == "CLICK"
+    assert result["choice"] == "e3"
+    assert post.call_count == 1
+
+
+@pytest.mark.parametrize("operation,target,blocked", [
+    ("click", 2, ["2"]), ("click", 999, []), ("click", True, []),
+    ("click", "document.querySelector('button')", []),
+    ("type_text", 2, []), ("double_click", 2, []), (None, 2, []),
+])
+def test_llm_case_normalization_does_not_relax_supported_targets(monkeypatch, operation, target, blocked):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    post = Mock(return_value={"choices": [{"message": {
+        "content": json.dumps({"operation": operation, "target": target}),
+    }}]})
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(ValueError, match="no valid observed action"):
+        model.choose_llm(page(), "Submit the search", [], blocked_indices=blocked)
+    assert post.call_count == 1
+
+
+
+def test_no_progress_stop_is_distinct_from_model_blocked(runner):
+    runner.state["history"] = [{"page_changed": False, "kind": "click"}] * 2
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["stop_reason"] == "no_progress"
+    runner.state["browser"].act.assert_called_once()
+
+
+def test_model_blocked_sets_its_own_stop_reason(runner):
+    runner.state["decision"] = {**decision("BLOCKED"), "operation": "BLOCKED", "target": None}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["stop_reason"] == "model_blocked"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_model_receives_group_headings_and_previous_click_group(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    current = page()
+    current["actions"][2]["group"] = "Destinations"
+    current["actions"][2]["visual_state"] = {"outline": "dashed", "border": "solid"}
+    post = Mock(return_value={"choices": [{"message": {"content": '{"operation":"CLICK","target":"2"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose_llm(current, "Connect the matching items", [
+        {"action": "Origin", "kind": "click", "target": "1", "group": "Sources"}
+    ])
+    context = json.loads(post.call_args.args[2]["messages"][1]["content"])
+    assert context["choices"]["CLICK"]["2"]["group"] == "Destinations"
+    assert context["recent_actions"][0]["group"] == "Sources"
+    assert context["last_executed_click"]["target"] == "1"
+    assert context["choices"]["CLICK"]["2"]["visual_state"]["outline"] == "dashed"
+
+
+def test_stalled_group_is_omitted_without_renumbering_or_fallback(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    current = page()
+    current["actions"][0]["group"] = current["actions"][1]["group"] = "Sources"
+    current["actions"][2]["group"] = "Destinations"
+    history = [{"choice": "e3", "target": "2", "kind": "click", "page_changed": False}] * 2
+    post = Mock(return_value={"choices": [{"message": {"content": '{"operation":"CLICK","target":"1"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(current, "Connect the matching items", history)
+    context = json.loads(post.call_args.args[2]["messages"][1]["content"])
+    assert set(context["choices"]["CLICK"]) == {"1"}
+    assert context["execution_feedback"]["temporarily_omitted_click_group"] == "Destinations"
+    assert result["choice"] == "e2"
+    assert post.call_count == 1
+
+
+def test_switching_groups_allows_one_setup_step_then_stops_if_still_unchanged(runner):
+    runner.state["history"] = [{"page_changed": False, "kind": "click", "group": "Destinations"}] * 2
+    runner.state["page"]["actions"][2]["group"] = "Sources"
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready"
+    runner.state["page"]["actions"][2]["group"] = "Destinations"
+    runner.state["decision"] = {**decision("e3"), "operation": "CLICK", "target": "2"}
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["stop_reason"] == "no_progress"
+    assert runner.state["browser"].act.call_count == 2
+
+
+
+def test_llama_cpp_schema_contains_only_matching_observed_unblocked_targets(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("MODEL_CONFIG", '{"local":{"backend":"llama_cpp"}}')
+    post = Mock(return_value={"choices": [{"message": {"content": '{"operation":"CLICK","target":"2"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose_llm(page(), "Submit the search", [], model="local", blocked_indices=["1"])
+    variants = post.call_args.args[2]["response_format"]["schema"]["oneOf"]
+    operations = {item["properties"]["operation"]["enum"][0]: item for item in variants}
+    assert set(operations) == {"CLICK", "WAIT", "DONE", "BLOCKED"}
+    assert operations["CLICK"]["properties"]["target"] == {"type": "string", "enum": ["2"]}
+    assert operations["WAIT"]["properties"]["target"] == {"type": "null"}
+
+
+@pytest.mark.parametrize("operation,delta", [("SCROLL_DOWN", 200), ("SCROLL_UP", -200)])
+def test_llm_scroll_uses_observed_region_and_null_target(monkeypatch, operation, delta):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    current = page()
+    observed = {"id": operation.lower(), "kind": "scroll", "frame_id": "f1", "node": 30,
+                "label": "Reveal additional choices", "delta": delta}
+    current["actions"].append(observed)
+    post = Mock(return_value={"choices": [{"message": {
+        "content": json.dumps({"operation": operation, "target": None})
+    }}]})
+    monkeypatch.setattr(model, "post_json", post)
+    result = model.choose_llm(current, "Inspect all choices", [])
+    assert result["choice"] == observed["id"]
+    assert result["target"] is None
+    assert next(a for a in current["actions"] if a["id"] == result["choice"]) == observed
+    context = json.loads(post.call_args.args[2]["messages"][1]["content"])
+    assert context["choices"][operation]["label"] == "Reveal additional choices"

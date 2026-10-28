@@ -46,8 +46,7 @@ function controls() {
   $("start").disabled = busy;
   $("goal").disabled = busy;
   $("target").disabled = busy;
-  $("decision-mode").disabled = busy;
-  $("text-model").disabled = busy;
+  $("model").disabled = busy;
   $("log-questions").disabled = busy;
   $("block-range").disabled = busy || !state?.page;
   $("choose").disabled = busy || !live;
@@ -85,33 +84,46 @@ function renderSelectors() {
   const selectedTarget = state?.target_id || $("target").value;
   $("target").innerHTML = (state?.tabs || []).length
     ? state.tabs.map((tab) =>
-        `<option value="${escape(tab.id)}">${escape(tab.title)} · ${escape(tab.url)}</option>`
+        `<option value="${escape(tab.id)}">${escape(tab.title)}</option>`
       ).join("")
     : '<option value="">No eligible browser tabs found</option>';
   if ([...$("target").options].some((option) => option.value === selectedTarget)) {
     $("target").value = selectedTarget;
   }
-  $("text-model").innerHTML = (state?.text_models || []).map((model) =>
-    `<option value="${escape(model)}">${escape(model)}${state.model_capabilities?.[model]?.image_compatible ? " · Images" : " · Text only"}</option>`
+  const selectedModel = state?.selected_model || $("model").value || "jev";
+  $("model").innerHTML = (state?.models || []).map((model) =>
+    `<option value="${escape(model.id)}">${escape(modelLabel(model))}</option>`
   ).join("");
-  $("text-model").value = state?.text_model || $("text-model").options[0]?.value || "";
-  $("decision-mode").value = state?.decision_mode || $("decision-mode").value || "jev";
-  const selectedMode = $("decision-mode").value;
-  $("model-help").textContent = selectedMode === "llm"
-    ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : "LLM used only when Jev chooses TYPE_TEXT";
+  $("model").value = selectedModel;
+  renderModelHelp();
+  renderTabDetail();
 }
+function modelLabel(model) {
+  if (model.id === "jev") return "Jev";
+  return model.name.replace(/-GGUF(?::.*)?$/i, "");
+}
+function renderTabDetail() {
+  const tab = state?.tabs?.find((item) => item.id === $("target").value);
+  $("tab-detail").textContent = tab?.url || "Open a browser tab to get started";
+  $("target").title = tab ? `${tab.title} · ${tab.url}` : "Browser tab";
+}
+function renderModelHelp() {
+  const model = state?.models?.find((item) => item.id === $("model").value);
+  if (!model) return;
+  $("model").title = model.name;
+  $("model-detail").innerHTML = [
+    `<span class="capability">${model.model_type === "decision" ? "Decision model" : "Standard LLM"}</span>`,
+    `<span class="capability ${model.image_compatible ? "" : "unavailable"}">${model.image_compatible ? "Images" : "No images"}</span>`,
+    `<span class="capability ${model.audio_compatible ? "" : "unavailable"}">${model.audio_compatible ? "Audio" : "No audio"}</span>`,
+  ].join("");
+  $("model-help").textContent = model.id === "jev"
+    ? `Jev selects actions; ${state?.text_model || "configured text helper"} supplies typed values.`
+    : "The selected model chooses actions and supplies typed values.";
+}
+
 function render() {
   if (!state) return;
   renderSelectors();
-  const llmMode = state.decision_mode === "llm";
-  $("choice-model").textContent = llmMode
-    ? `LLM · ${state.text_model}`
-    : state.typesafe_model;
-  $("text-model-tag").textContent = llmMode
-    ? "decisions + text"
-    : `${state.text_model} text helper`;
-  $("helper").textContent = `Text helper · ${state.text_model}`;
   $("plan").innerHTML = (state.plan || [])
     .map(
       (goal, i) =>
@@ -123,13 +135,20 @@ function render() {
       state.decision ||
       (state.status === "done" ? state.decisions?.at(-1) : null);
   const labels = {
-    idle: "Ready to explore",
+    idle: "Ready when you are",
     ready: "Page observed · ready for a decision",
     predicted: "Choice ready · inspect or execute",
     done: "Model reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
   };
-  $("status").textContent = labels[state.status] || state.status;
+  const stopLabels = {
+    no_progress: "Stopped · three actions made no observed progress",
+    model_blocked: "Stopped · model found no supported next action",
+    step_budget: "Stopped · action limit reached",
+  };
+  $("status").textContent = state.status === "blocked"
+    ? stopLabels[state.stop_reason] || labels.blocked
+    : labels[state.status] || state.status;
   if (!page) {
     controls();
     return;
@@ -147,12 +166,12 @@ function render() {
   const chosen = page.actions.find((a) => a.id === d?.choice);
   $("choice-title").textContent = d
     ? chosen?.label || d.choice
-    : "Choose an action";
+    : "Ready for the next action";
   $("latency").textContent = d ? `${d.latency_ms} ms` : "—";
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
   $("completion").textContent = d ? d.operation : "—";
   $("ranking-note").textContent = d
-    ? d.decision_engine === "llm" ? "Chosen by LLM" : "Ranked by Jev"
+    ? d.decision_engine === "llm" ? "Model choice" : "Ranked by Jev"
     : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
   $("operation-choices").innerHTML = op.length
@@ -208,15 +227,14 @@ $("task-form").addEventListener("submit", (event) => {
       call("reset", {
         goal: $("goal").value,
         target_id: $("target").value,
-        text_model: $("text-model").value,
-        decision_mode: $("decision-mode").value,
+        model: $("model").value,
         log_questions: $("log-questions").checked,
       }),
     "Attaching to the selected tab…",
   );
 });
 $("choose").addEventListener("click", () =>
-  perform(() => call("predict", {blocked_indices: blockedIndices()}), "Jev is comparing the actions…"),
+  perform(() => call("predict", {blocked_indices: blockedIndices()}), "Choosing the next action…"),
 );
 $("execute").addEventListener("click", () =>
   perform(
@@ -250,12 +268,8 @@ $("stop").addEventListener("click", () => {
 $("overlays").addEventListener("change", () => {
   $("targets").hidden = !$("overlays").checked;
 });
-$("decision-mode").addEventListener("change", () => {
-  const selectedMode = $("decision-mode").value;
-  $("model-help").textContent = selectedMode === "llm"
-    ? "LLM chooses actions and supplies TYPE_TEXT values"
-    : "LLM used only when Jev chooses TYPE_TEXT";
-});
+$("model").addEventListener("change", renderModelHelp);
+$("target").addEventListener("change", renderTabDetail);
 $("choices").addEventListener("pointerover", (event) => {
   const id = event.target.closest("[data-action]")?.dataset.action;
   document
@@ -303,5 +317,5 @@ fetch("/api/state")
     render();
   })
   .catch(() => {
-    $("status").textContent = "Cannot reach local demo server";
+    $("status").textContent = "Cannot reach the workspace server";
   });

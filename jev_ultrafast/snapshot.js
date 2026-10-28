@@ -10,6 +10,7 @@
   cache.nextFrame ||= 1;
   cache.nextDocument ||= 1;
   cache.frames = new Map();
+  cache.scrollRegions = [];
 
   const roles = ['button','link','checkbox','radio','switch','tab','menuitem','menuitemradio',
     'option','gridcell','combobox','textbox','searchbox','spinbutton'];
@@ -59,6 +60,24 @@
     }
     const wrapped=e.closest('label');
     return wrapped && visible(wrapped) ? wrapped : null;
+  };
+  // Short, visible headings before a control's container describe its group without site-specific selectors.
+  const groupFor = e => {
+    let branch=e;
+    for (let depth=0;branch?.parentElement && depth<5;depth++,branch=branch.parentElement) {
+      for (let sibling=branch.previousElementSibling;sibling;sibling=sibling.previousElementSibling) {
+        if (!visible(sibling) || sibling.matches(selector) || sibling.querySelector(selector)) continue;
+        const text=(sibling.innerText||'').trim().replace(/\s+/g,' ');
+        if (text && text.length<=120) return text;
+      }
+    }
+    return '';
+  };
+  // Observe authored visual selection cues without treating focus or animation as semantic state.
+  const visualState = e => {
+    const style=e.ownerDocument.defaultView.getComputedStyle(e);
+    return {outline:style.outlineStyle==='dashed' || style.outlineStyle==='dotted' ?
+      style.outlineStyle : 'none',border:style.borderStyle};
   };
   const frameId = frame => {
     if (!frame) return 'f0';
@@ -117,6 +136,24 @@
     const r=e.getBoundingClientRect();
     return {x:offset.x+r.x,y:offset.y+r.y,w:r.width,h:r.height};
   };
+  cache.clippedRect = (id,e) => {
+    const ctx=cache.frames.get(id), r=e.getBoundingClientRect();
+    if (!ctx) return null;
+    let left=Math.max(0,r.left),top=Math.max(0,r.top);
+    let right=Math.min(ctx.win.innerWidth,r.right),bottom=Math.min(ctx.win.innerHeight,r.bottom);
+    for (let parent=e.parentElement;parent;parent=parent.parentElement) {
+      const style=ctx.win.getComputedStyle(parent), bounds=parent.getBoundingClientRect();
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowX)) {
+        left=Math.max(left,bounds.left+parent.clientLeft);
+        right=Math.min(right,bounds.left+parent.clientLeft+parent.clientWidth);
+      }
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowY)) {
+        top=Math.max(top,bounds.top+parent.clientTop);
+        bottom=Math.min(bottom,bounds.top+parent.clientTop+parent.clientHeight);
+      }
+    }
+    return right>left && bottom>top ? {x:left,y:top,w:right-left,h:bottom-top} : null;
+  };
   cache.guard = (id,e) => {
     if (!e?.isConnected || !visible(e)) return null;
     const ctx=cache.frames.get(id);
@@ -129,7 +166,8 @@
       control.readOnly??null,control.matches?.(':disabled')??false,
       control.getAttribute?.('aria-disabled')??null,control.getAttribute?.('aria-expanded')??null,
       control.getAttribute?.('aria-checked')??null,control.getAttribute?.('aria-selected')??null,
-      control.getAttribute?.('href')??null,scope?.innerText?.slice(0,6000)||''
+      control.getAttribute?.('aria-pressed')??null,
+      control.getAttribute?.('href')??null,groupFor(control),visualState(control),scope?.innerText?.slice(0,6000)||''
     ];
   };
   cache.pageKey = () => [
@@ -138,7 +176,11 @@
       ctx.id,documentId(ctx.doc),
       rootsFor(ctx.doc).flatMap(root=>[...root.querySelectorAll('input,textarea,select')]).filter(safe)
         .map(e=>[identity(ctx,e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])
-    ])
+    ]),
+    cache.scrollRegions.map(({frame_id,node})=>{
+      const e=cache.resolve(frame_id,node);
+      return [frame_id,node,e?.scrollTop,e?.scrollHeight,e?.clientHeight];
+    })
   ];
 
   const actions=[];
@@ -151,7 +193,9 @@
       const value=node.textContent.trim(), parent=node.parentElement;
       if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
       range.selectNodeContents(node);
-      const r=range.getBoundingClientRect();
+      const r=range.getBoundingClientRect(), clipped=cache.clippedRect(ctx.id,parent);
+      if (!clipped || r.bottom<=clipped.y || r.top>=clipped.y+clipped.h ||
+          r.right<=clipped.x || r.left>=clipped.x+clipped.w) continue;
       if (r.width>0 && r.height>0 && r.bottom>0 && r.top<ctx.win.innerHeight &&
           r.right>0 && r.left<ctx.win.innerWidth) {
         words.push(value);
@@ -171,6 +215,21 @@
 
     const roots=rootsFor(doc);
     const words=[];
+    for (const e of [doc.scrollingElement,...roots.flatMap(root=>[...root.querySelectorAll('*')])]) {
+      if (!e || !visible(e) || e.scrollHeight<=e.clientHeight+2 || e.clientHeight<30) continue;
+      const isDocument=e===doc.scrollingElement;
+      if (!isDocument && !/(auto|scroll)/.test(win.getComputedStyle(e).overflowY)) continue;
+      const clipped=isDocument ? {x:0,y:0,w:win.innerWidth,h:win.innerHeight} : cache.clippedRect(id,e);
+      if (!clipped || clipped.w<30 || clipped.h<30) continue;
+      const offset=offsetFor(ctx);
+      const x=offset.x+clipped.x+clipped.w/2,y=offset.y+clipped.y+clipped.h/2;
+      if (x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+      if (cache.scrollRegions.some(region=>region.frame_id===id && region.node===identity(ctx,e))) continue;
+      cache.scrollRegions.push({frame_id:id,node:identity(ctx,e),
+        label:name(e).slice(0,100)||e.getAttribute('title')||'content',
+        y:e.scrollTop,height:e.scrollHeight,viewport:e.clientHeight,
+        area:clipped.w*clipped.h,priority:isDocument ? (frame ? 1 : 0) : 2});
+    }
     for (const root of roots) for (const e of root.querySelectorAll(selector)) {
       if (!safe(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
       if (e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type)) {
@@ -186,16 +245,21 @@
       }
       if (!visible(target)) continue;
       const local=target.getBoundingClientRect();
+      const clipped=cache.clippedRect(id,target);
+      if (!clipped) continue;
       const x=local.x+local.width/2, y=local.y+local.height/2;
       if (local.width<=0 || local.height<=0 || x<0 || y<0 ||
-          x>=win.innerWidth || y>=win.innerHeight) continue;
+          x>=win.innerWidth || y>=win.innerHeight || x<clipped.x || y<clipped.y ||
+          x>=clipped.x+clipped.w || y>=clipped.y+clipped.h) continue;
       const rect=cache.topRect(id,target);
       if (!rect || rect.x+rect.w<=0 || rect.y+rect.h<=0 ||
           rect.x>=innerWidth || rect.y>=innerHeight) continue;
       if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
       const base={frame_id:id,node:identity(ctx,target),role:rname,
         label:name(e)||name(target)||rname,rect};
-      for (const key of ['checked','selected','expanded']) {
+      const group=groupFor(e);
+      if (group) { base.group=group; base.visual_state=visualState(e); }
+      for (const key of ['checked','selected','expanded','pressed']) {
         const value=e.getAttribute('aria-'+key);
         if (value!==null) base[key]=value;
       }
@@ -248,14 +312,21 @@
   }
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key[6]];
+    document.title,text,semantics,page_key[6],page_key[7]];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
   actions.forEach((action,index)=>action.id='e'+(index+1));
   const height=document.documentElement.scrollHeight;
-  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
-  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  for (const [direction,sign] of [['down',1],['up',-1]]) {
+    const regions=cache.scrollRegions.filter(region=>sign>0 ?
+      region.y+region.viewport<region.height-2 : region.y>2);
+    regions.sort((a,b)=>b.priority-a.priority || b.area-a.area);
+    const region=regions[0];
+    if (region) actions.push({id:'scroll_'+direction,kind:'scroll',frame_id:region.frame_id,node:region.node,
+      label:'Scroll '+direction+' to reveal more of '+region.label,
+      delta:sign*Math.min(560,Math.max(100,Math.round(region.viewport*0.75)))});
+  }
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height,regions:cache.scrollRegions},actions,marker,page_key,guards,omitted_actions};
 })()
